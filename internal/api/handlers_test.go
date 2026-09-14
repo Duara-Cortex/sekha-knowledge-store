@@ -91,6 +91,46 @@ func (m *apiMockStore) GetGraphSummary(ctx context.Context) (*model.GraphSummary
 	}, nil
 }
 
+func (m *apiMockStore) FindMatchingNode(ctx context.Context, label string, entityType string) (*model.Node, error) {
+	for _, n := range m.nodes {
+		if n.Label == label {
+			return &n, nil
+		}
+	}
+	return nil, nil
+}
+
+func (m *apiMockStore) QueueTrace(ctx context.Context, trace model.EpisodicTrace) error {
+	return nil
+}
+
+func (m *apiMockStore) GetPendingTraces(ctx context.Context, limit int) ([]model.EpisodicTrace, error) {
+	return nil, nil
+}
+
+func (m *apiMockStore) MarkTraceConsolidated(ctx context.Context, traceID string, consolidatedAt time.Time) error {
+	return nil
+}
+
+func (m *apiMockStore) ReinforceEdge(ctx context.Context, sourceID, targetID, relationType string, deltaW float64, maxWeight float64, reinforcedAt time.Time) (float64, error) {
+	return 1.0 + deltaW, nil
+}
+
+func (m *apiMockStore) BoostNodeStability(ctx context.Context, nodeID string, deltaStability float64, reinforcedAt time.Time) error {
+	return nil
+}
+
+func (m *apiMockStore) ApplyDecayAndPrune(ctx context.Context, cfg model.DecayConfig, refTime time.Time) (decayed int, archived int, prunedEdges int, err error) {
+	return 0, 0, 0, nil
+}
+
+func (m *apiMockStore) GetConsolidationStats(ctx context.Context) (*model.ConsolidationStats, error) {
+	return &model.ConsolidationStats{
+		ActiveNodes: int64(len(m.nodes)),
+		ActiveEdges: int64(len(m.edges)),
+	}, nil
+}
+
 func TestAPIServer_Endpoints(t *testing.T) {
 	ctx := context.Background()
 	ms := newAPIMockStore()
@@ -185,5 +225,36 @@ func TestAPIServer_Endpoints(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &healthResp)
 	if healthResp.Status != "healthy" || healthResp.Port != 8084 || healthResp.Node != "sekha-node1" {
 		t.Fatalf("unexpected health payload: %+v", healthResp)
+	}
+
+	// 5. Test Consolidate Endpoint
+	consolidatePayload := model.ConsolidateRequest{
+		TraceID:   "test-trace-api",
+		SessionID: "sess-api-01",
+		TaskGoal:  "Verify consolidation endpoint handler",
+		Outcome:   model.OutcomeSuccess,
+		Trajectory: []model.TrajectoryStep{
+			{
+				StepIndex: 1,
+				Thought:   "Processing step for unit test",
+				Action:    "test_action",
+				Status:    "success",
+			},
+		},
+	}
+	body, _ = json.Marshal(consolidatePayload)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/memory/consolidate", bytes.NewReader(body))
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted && rec.Code != http.StatusOK {
+		t.Fatalf("expected status 202 or 200 on consolidate, got %d", rec.Code)
+	}
+
+	// 6. Test Consolidation Stats Endpoint
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/memory/consolidation/stats", nil)
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200 on consolidation stats, got %d", rec.Code)
 	}
 }

@@ -88,6 +88,9 @@ func (e *Engine) Hydrate(ctx context.Context) error {
 	e.index = make([]*cachedNode, 0, len(headers))
 
 	for _, h := range headers {
+		if h.IsArchived {
+			continue
+		}
 		cn := &cachedNode{
 			id:             h.ID,
 			entityType:     h.EntityType,
@@ -110,6 +113,20 @@ func (e *Engine) RegisterNodes(nodes []model.Node) {
 	defer e.mu.Unlock()
 
 	for _, n := range nodes {
+		if n.IsArchived {
+			if _, exists := e.nodes[n.ID]; exists {
+				delete(e.nodes, n.ID)
+				newIndex := make([]*cachedNode, 0, len(e.index))
+				for _, item := range e.index {
+					if item.id != n.ID {
+						newIndex = append(newIndex, item)
+					}
+				}
+				e.index = newIndex
+			}
+			continue
+		}
+
 		var mag float32
 		if len(n.Embedding) > 0 {
 			var sum float64
