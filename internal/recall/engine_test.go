@@ -112,6 +112,46 @@ func (m *mockStore) GetGraphSummary(ctx context.Context) (*model.GraphSummary, e
 	}, nil
 }
 
+func (m *mockStore) FindMatchingNode(ctx context.Context, label string, entityType string) (*model.Node, error) {
+	for _, n := range m.nodes {
+		if n.Label == label {
+			return &n, nil
+		}
+	}
+	return nil, nil
+}
+
+func (m *mockStore) QueueTrace(ctx context.Context, trace model.EpisodicTrace) error {
+	return nil
+}
+
+func (m *mockStore) GetPendingTraces(ctx context.Context, limit int) ([]model.EpisodicTrace, error) {
+	return nil, nil
+}
+
+func (m *mockStore) MarkTraceConsolidated(ctx context.Context, traceID string, consolidatedAt time.Time) error {
+	return nil
+}
+
+func (m *mockStore) ReinforceEdge(ctx context.Context, sourceID, targetID, relationType string, deltaW float64, maxWeight float64, reinforcedAt time.Time) (float64, error) {
+	return 1.0 + deltaW, nil
+}
+
+func (m *mockStore) BoostNodeStability(ctx context.Context, nodeID string, deltaStability float64, reinforcedAt time.Time) error {
+	return nil
+}
+
+func (m *mockStore) ApplyDecayAndPrune(ctx context.Context, cfg model.DecayConfig, refTime time.Time) (decayed int, archived int, prunedEdges int, err error) {
+	return 0, 0, 0, nil
+}
+
+func (m *mockStore) GetConsolidationStats(ctx context.Context) (*model.ConsolidationStats, error) {
+	return &model.ConsolidationStats{
+		ActiveNodes: int64(len(m.nodes)),
+		ActiveEdges: int64(len(m.edges)),
+	}, nil
+}
+
 func TestRecallEngine_WeightedRanking(t *testing.T) {
 	ctx := context.Background()
 	ms := newMockStore()

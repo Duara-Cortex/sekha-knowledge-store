@@ -16,6 +16,7 @@ type NodeHeader struct {
 	LastAccessedAt time.Time
 	AccessCount    int64
 	StabilityScore float64
+	IsArchived     bool
 }
 
 // Store defines persistence operations for the relational knowledge graph.
@@ -32,11 +33,23 @@ type Store interface {
 	GetNodes(ctx context.Context, ids []string) (map[string]model.Node, error)
 	GetAllNodeHeaders(ctx context.Context) ([]NodeHeader, error)
 	GetEdgesForNodes(ctx context.Context, nodeIDs []string) ([]model.Edge, error)
+	FindMatchingNode(ctx context.Context, label string, entityType string) (*model.Node, error)
 
 	// Usage tracking
 	RecordAccess(ctx context.Context, nodeIDs []string, accessTime time.Time) error
 
+	// Episodic Trace Queueing & Consolidation Lifecycle
+	QueueTrace(ctx context.Context, trace model.EpisodicTrace) error
+	GetPendingTraces(ctx context.Context, limit int) ([]model.EpisodicTrace, error)
+	MarkTraceConsolidated(ctx context.Context, traceID string, consolidatedAt time.Time) error
+
+	// Hebbian Reinforcement & Mathematical Decay
+	ReinforceEdge(ctx context.Context, sourceID, targetID, relationType string, deltaW float64, maxWeight float64, reinforcedAt time.Time) (float64, error)
+	BoostNodeStability(ctx context.Context, nodeID string, deltaStability float64, reinforcedAt time.Time) error
+	ApplyDecayAndPrune(ctx context.Context, cfg model.DecayConfig, refTime time.Time) (decayed int, archived int, prunedEdges int, err error)
+
 	// Telemetry & Metrics
 	GetGraphSummary(ctx context.Context) (*model.GraphSummary, error)
 	GetCounts(ctx context.Context) (int64, int64, error)
+	GetConsolidationStats(ctx context.Context) (*model.ConsolidationStats, error)
 }

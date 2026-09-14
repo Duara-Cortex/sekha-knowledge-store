@@ -4,24 +4,28 @@ import "time"
 
 // Node represents a vertex in the relational knowledge graph.
 type Node struct {
-	ID             string    `json:"id"`
-	EntityType     string    `json:"entity_type"`
-	Label          string    `json:"label"`
-	Summary        string    `json:"summary"`
-	Embedding      []float32 `json:"embedding,omitempty"`
-	CreatedAt      time.Time `json:"created_at"`
-	LastAccessedAt time.Time `json:"last_accessed_at"`
-	AccessCount    int64     `json:"access_count"`
-	StabilityScore float64   `json:"stability_score"`
+	ID               string     `json:"id"`
+	EntityType       string     `json:"entity_type"`
+	Label            string     `json:"label"`
+	Summary          string     `json:"summary"`
+	Embedding        []float32  `json:"embedding,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	LastAccessedAt   time.Time  `json:"last_accessed_at"`
+	LastReinforcedAt time.Time  `json:"last_reinforced_at,omitempty"`
+	ArchivedAt       *time.Time `json:"archived_at,omitempty"`
+	AccessCount      int64      `json:"access_count"`
+	StabilityScore   float64    `json:"stability_score"`
+	IsArchived       bool       `json:"is_archived"`
 }
 
 // Edge represents a directed, weighted relationship between two nodes.
 type Edge struct {
-	SourceID     string    `json:"source_id"`
-	TargetID     string    `json:"target_id"`
-	RelationType string    `json:"relation_type"`
-	Weight       float64   `json:"weight"`
-	CreatedAt    time.Time `json:"created_at"`
+	SourceID         string    `json:"source_id"`
+	TargetID         string    `json:"target_id"`
+	RelationType     string    `json:"relation_type"`
+	Weight           float64   `json:"weight"`
+	CreatedAt        time.Time `json:"created_at"`
+	LastReinforcedAt time.Time `json:"last_reinforced_at,omitempty"`
 }
 
 // ScoredNode wraps a Node with the associative recall score breakdown.

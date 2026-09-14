@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Duara-Cortex/sekha-knowledge-store/internal/consolidation"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/model"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/recall"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/store"
@@ -12,29 +13,40 @@ import (
 
 // Server implements the HTTP API for the knowledge graph store.
 type Server struct {
-	store     store.Store
-	engine    *recall.Engine
-	mux       *http.ServeMux
-	startTime time.Time
-	port      int
+	store               store.Store
+	engine              *recall.Engine
+	consolidationEngine *consolidation.Engine
+	mux                 *http.ServeMux
+	startTime           time.Time
+	port                int
 }
 
 // NewServer builds and registers all API routes for port 8084.
 func NewServer(s store.Store, e *recall.Engine, port int) *Server {
 	srv := &Server{
-		store:     s,
-		engine:    e,
-		mux:       http.NewServeMux(),
-		startTime: time.Now(),
-		port:      port,
+		store:               s,
+		engine:              e,
+		consolidationEngine: consolidation.NewEngine(s, model.DefaultDecayConfig()),
+		mux:                 http.NewServeMux(),
+		startTime:           time.Now(),
+		port:                port,
 	}
 	srv.registerRoutes()
 	return srv
 }
 
+// SetConsolidationEngine overrides the default consolidation engine instance.
+func (s *Server) SetConsolidationEngine(ce *consolidation.Engine) {
+	if ce != nil {
+		s.consolidationEngine = ce
+	}
+}
+
 func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/memory/recall", s.handleRecall)
 	s.mux.HandleFunc("POST /api/v1/memory/insert", s.handleInsert)
+	s.mux.HandleFunc("POST /api/v1/memory/consolidate", s.handleConsolidate)
+	s.mux.HandleFunc("GET /api/v1/memory/consolidation/stats", s.handleConsolidationStats)
 	s.mux.HandleFunc("GET /api/v1/memory/graph", s.handleGraph)
 	s.mux.HandleFunc("GET /api/v1/memory/health", s.handleHealth)
 	s.mux.HandleFunc("GET /health", s.handleHealth)
@@ -157,4 +169,49 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// handleConsolidate processes POST /api/v1/memory/consolidate dispatched from Node 2.
+func (s *Server) handleConsolidate(w http.ResponseWriter, r *http.Request) {
+	var req model.ConsolidateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(model.ConsolidateResponse{
+			Status:  "error",
+			Message: "invalid JSON payload: " + err.Error(),
+		})
+		return
+	}
+
+	resp, err := s.consolidationEngine.IngestTrace(r.Context(), req)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(model.ConsolidateResponse{
+			Status:  "error",
+			Message: "trace consolidation failed: " + err.Error(),
+		})
+		return
+	}
+
+	if resp.Synchronous {
+		w.WriteHeader(http.StatusOK)
+	} else {
+		w.WriteHeader(http.StatusAccepted)
+	}
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// handleConsolidationStats processes GET /api/v1/memory/consolidation/stats.
+func (s *Server) handleConsolidationStats(w http.ResponseWriter, r *http.Request) {
+	stats, err := s.consolidationEngine.GetStats(r.Context())
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "failed fetching consolidation stats: " + err.Error(),
+		})
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(stats)
 }
