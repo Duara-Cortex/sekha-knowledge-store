@@ -31,7 +31,7 @@ func DefaultConfig() EngineConfig {
 		DefaultGamma:      0.2,
 		DecayHalfLife:     24 * time.Hour,
 		FrequencyMaxCount: 100.0,
-		NeighborHopBoost:  0.5,
+		NeighborHopBoost:  0.35,
 		MaxCandidatePool:  20,
 	}
 }
@@ -147,6 +147,7 @@ func (e *Engine) RegisterNodes(nodes []model.Node) {
 type candidateScore struct {
 	id             string
 	totalScore     float64
+	baseScore      float64
 	simScore       float64
 	freqScore      float64
 	recencyScore   float64
@@ -217,13 +218,12 @@ func (e *Engine) Recall(ctx context.Context, req model.RecallRequest) (*model.Re
 				dot += float64(req.Embedding[i] * cn.embedding[i])
 			}
 			cosine := dot / (float64(queryMag) * float64(cn.magnitude))
-			// Clamp cosine [-1.0, 1.0] to [0.0, 1.0]
 			if cosine > 1.0 {
 				cosine = 1.0
-			} else if cosine < -1.0 {
-				cosine = -1.0
+			} else if cosine < 0.0 {
+				cosine = 0.0
 			}
-			simScore = (cosine + 1.0) / 2.0
+			simScore = cosine
 		}
 
 		// 2. Usage Frequency: log(1 + access_count)
@@ -255,6 +255,7 @@ func (e *Engine) Recall(ctx context.Context, req model.RecallRequest) (*model.Re
 		cs := &candidateScore{
 			id:           cn.id,
 			totalScore:   rScore,
+			baseScore:    rScore,
 			simScore:     simScore,
 			freqScore:    freqScore,
 			recencyScore: recencyScore,
@@ -308,9 +309,16 @@ func (e *Engine) Recall(ctx context.Context, req model.RecallRequest) (*model.Re
 				nCand, exists := candidates[neighborID]
 				if exists {
 					boost := e.cfg.NeighborHopBoost * math.Min(1.0, edge.Weight) * seedScore
-					nCand.totalScore += boost
-					if nCand.hopDistance == 0 && nCand.simScore < 0.1 {
-						nCand.hopDistance = 1
+					newScore := nCand.baseScore + boost
+					// A 1-hop neighbor cannot exceed the seed node that activated it
+					if nCand.baseScore < seedScore && newScore >= seedScore {
+						newScore = seedScore * 0.95
+					}
+					if newScore > nCand.totalScore {
+						nCand.totalScore = newScore
+						if nCand.hopDistance == 0 && nCand.simScore < 0.2 {
+							nCand.hopDistance = 1
+						}
 					}
 				}
 			}

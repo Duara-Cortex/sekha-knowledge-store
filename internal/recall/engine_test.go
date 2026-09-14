@@ -230,13 +230,13 @@ func TestRecallEngine_OneHopNeighborExpansion(t *testing.T) {
 		StabilityScore: 1.0,
 	}
 
-	// Irrelevant node C
+	// Irrelevant node C (orthogonal embedding to query)
 	nC := model.Node{
 		ID:             "node-C",
 		EntityType:     "concept",
 		Label:          "Unrelated Note",
 		Summary:        "Nothing to do with packets",
-		Embedding:      []float32{0.1, 0.0},
+		Embedding:      []float32{-0.9, 0.1},
 		CreatedAt:      now,
 		LastAccessedAt: now.Add(-24 * time.Hour),
 		AccessCount:    0,
