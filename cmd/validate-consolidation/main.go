@@ -161,24 +161,32 @@ func main() {
 	fmt.Printf("         Queued %d traces in %.2fs (%.1f traces/sec)\n",
 		*eventCount, ingestDuration.Seconds(), float64(*eventCount)/ingestDuration.Seconds())
 
-	// 2. Execute intermediate consolidation cycles across simulated timeline
-	fmt.Println("[Step 2] Executing background consolidation and graph fusion cycle...")
+	// 2. Execute intermediate consolidation cycles to fuse all queued traces
+	fmt.Println("[Step 2] Executing background consolidation and graph fusion cycles...")
 	fuseStart := time.Now()
-	fuseResp, err := engine.RunConsolidationCycle(ctx, baseTime.Add(7*24*time.Hour))
-	if err != nil {
-		fmt.Printf("[FATAL] Initial consolidation cycle failed: %v\n", err)
-		os.Exit(1)
+	totalTracesFused := 0
+	for {
+		fuseResp, err := engine.RunConsolidationCycle(ctx, baseTime.Add(7*24*time.Hour))
+		if err != nil {
+			fmt.Printf("[FATAL] Consolidation cycle failed: %v\n", err)
+			os.Exit(1)
+		}
+		totalTracesFused += fuseResp.TracesFused
+		if fuseResp.TracesFused == 0 {
+			break
+		}
 	}
 	fmt.Printf("         Fused %d traces into knowledge graph in %.2fms\n",
-		fuseResp.TracesFused, time.Since(fuseStart).Seconds()*1000.0)
+		totalTracesFused, time.Since(fuseStart).Seconds()*1000.0)
 
 	initialStats, _ := engine.GetStats(ctx)
-	fmt.Printf("[Mid-Cycle Topology] Active Nodes: %d | Active Edges: %d | Mean Stability: %.3f\n",
-		initialStats.ActiveNodes, initialStats.ActiveEdges, initialStats.MeanStabilityScore)
+	peakActiveNodes := initialStats.ActiveNodes
+	fmt.Printf("[Mid-Cycle Topology] Active Nodes (Peak): %d | Active Edges: %d | Mean Stability: %.3f\n",
+		peakActiveNodes, initialStats.ActiveEdges, initialStats.MeanStabilityScore)
 
 	// 3. Advance time past grace period to evaluate exponential decay and soft-archival
-	fmt.Println("[Step 3] Advancing simulation clock by 14 days to evaluate decay & pruning...")
-	evalTime := baseTime.Add(21 * 24 * time.Hour) // 21 days total (> 7-day grace period and multiple half-lives)
+	fmt.Println("[Step 3] Advancing simulation clock by 21 days to evaluate decay & pruning...")
+	evalTime := baseTime.Add(28 * 24 * time.Hour) // 21 days past consolidation (> 7-day grace period and multiple half-lives)
 
 	decayStart := time.Now()
 	cycleResp, err := engine.RunConsolidationCycle(ctx, evalTime)
@@ -230,6 +238,7 @@ func main() {
 	fmt.Printf(" Total Episodic Events:    %d\n", *eventCount)
 	fmt.Printf(" Ingestion Throughput:     %.1f traces/sec\n", float64(*eventCount)/ingestDuration.Seconds())
 	fmt.Printf(" Cycle Execution Duration: %.2f ms\n", float64(decayDuration.Microseconds())/1000.0)
+	fmt.Printf(" Peak Active Nodes:        %d\n", peakActiveNodes)
 	fmt.Printf(" Active Nodes (Retained):  %d\n", activeCount)
 	fmt.Printf(" Soft-Archived Nodes:      %d (Transient noise pruned)\n", archivedCount)
 	fmt.Printf(" Active Relational Edges:  %d\n", finalStats.ActiveEdges)
@@ -239,10 +248,13 @@ func main() {
 	fmt.Printf(" Mean Active Edge Weight:  %.3f\n", finalStats.MeanEdgeWeight)
 	fmt.Println("-----------------------------------------------------------------")
 
-	// Assertion checks
-	passNoisePruning := archivedCount > 0 && float64(archivedCount)/float64(*eventCount) >= 0.40
+	// Assertion checks:
+	// 1. Noise Pruning: transient noise was pruned and archived
+	passNoisePruning := archivedCount > 0 && float64(archivedCount)/float64(peakActiveNodes) >= 0.40
+	// 2. Hub Stabilization: core recurrent concepts stabilized with high scores
 	passHubStabilization := stableHubs >= len(hubConcepts)/2 && meanHubScore >= 0.65
-	passBoundedGrowth := activeCount < int64(*eventCount)
+	// 3. Bounded Growth: post-decay active nodes are bounded well below peak expansion
+	passBoundedGrowth := activeCount < peakActiveNodes && activeCount <= peakActiveNodes/2
 
 	if passNoisePruning && passHubStabilization && passBoundedGrowth {
 		fmt.Println(" RESULT: PASS - 1,000 synthetic episodic task events validation")
