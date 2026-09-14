@@ -1,0 +1,30 @@
+[Unit]
+Description=Sekha Long-Term Knowledge Graph Store Daemon (Node 1)
+Documentation=https://github.com/Duara-Cortex/sekha-knowledge-store
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=admin
+Group=admin
+WorkingDirectory=/home/admin
+ExecStart=/usr/local/bin/sekha-knowledge-store -port 8084 -db /var/lib/sekha/knowledge.db -alpha 0.6 -beta 0.2 -gamma 0.2 -tau 24h
+Restart=always
+RestartSec=3
+
+# Resource and file limits
+LimitNOFILE=65535
+
+# Process sandbox protections
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/var/lib/sekha
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sekha-knowledge-store
+
+[Install]
+WantedBy=multi-user.target
