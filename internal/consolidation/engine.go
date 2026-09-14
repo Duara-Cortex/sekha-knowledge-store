@@ -120,7 +120,12 @@ func (e *Engine) RunConsolidationCycle(ctx context.Context, refTime time.Time) (
 		extracted := e.extractor.Extract(trace)
 		totalEntitiesExtracted += len(extracted.Entities)
 
-		fusionRes, err := e.fusion.Fuse(ctx, extracted, refTime)
+		traceTime := trace.CreatedAt
+		if traceTime.IsZero() {
+			traceTime = refTime
+		}
+
+		fusionRes, err := e.fusion.Fuse(ctx, extracted, traceTime)
 		if err != nil {
 			log.Printf("[Consolidation] Error fusing trace %s: %v", trace.ID, err)
 			continue

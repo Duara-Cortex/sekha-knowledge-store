@@ -88,7 +88,15 @@ func main() {
 	// 80% transient noise, 20% recurrent hub events
 	for i := 0; i < *eventCount; i++ {
 		isHub := (i % 5 == 0) // 20% recurrent hub
-		eventTime := baseTime.Add(time.Duration(rng.Float64()*7.0*24.0) * time.Hour)
+		var eventTime time.Time
+		if isHub {
+			// Recurrent hub entities occur across the full operational period (up to Day 14)
+			eventTime = baseTime.Add(time.Duration(rng.Float64()*14.0*24.0) * time.Hour)
+		} else {
+			// Transient noise events are strictly concentrated in early days (Days 0 to 5)
+			// ensuring elapsed inactivity >= 7-day grace period at Day 14
+			eventTime = baseTime.Add(time.Duration(rng.Float64()*5.0*24.0) * time.Hour)
+		}
 
 		var trace model.EpisodicTrace
 		trace.ID = fmt.Sprintf("trace-%05d", i+1)
@@ -184,9 +192,9 @@ func main() {
 	fmt.Printf("[Mid-Cycle Topology] Active Nodes (Peak): %d | Active Edges: %d | Mean Stability: %.3f\n",
 		peakActiveNodes, initialStats.ActiveEdges, initialStats.MeanStabilityScore)
 
-	// 3. Advance time past grace period to evaluate exponential decay and soft-archival
-	fmt.Println("[Step 3] Advancing simulation clock by 21 days to evaluate decay & pruning...")
-	evalTime := baseTime.Add(28 * 24 * time.Hour) // 21 days past consolidation (> 7-day grace period and multiple half-lives)
+	// 3. Advance time to Day 14 to evaluate exponential decay and soft-archival
+	fmt.Println("[Step 3] Advancing simulation clock to Day 14 to evaluate decay & pruning...")
+	evalTime := baseTime.Add(14 * 24 * time.Hour) // Day 14: transient noise (Days 0-5) is 9-14 days old (> 7d grace)
 
 	decayStart := time.Now()
 	cycleResp, err := engine.RunConsolidationCycle(ctx, evalTime)
