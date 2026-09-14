@@ -51,7 +51,7 @@ func main() {
 		DefaultGamma:      *gamma,
 		DecayHalfLife:     *decayTau,
 		FrequencyMaxCount: 100.0,
-		NeighborHopBoost:  0.5,
+		NeighbourHopBoost: 0.35,
 		MaxCandidatePool:  20,
 	}
 

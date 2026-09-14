@@ -18,8 +18,8 @@ type EngineConfig struct {
 	DefaultBeta        float64       // Usage frequency weight (default: 0.2)
 	DefaultGamma       float64       // Recency decay weight (default: 0.2)
 	DecayHalfLife      time.Duration // Time constant tau for recency decay (default: 24h)
-	FrequencyMaxCount  float64       // Access count normalization baseline (default: 100.0)
-	NeighborHopBoost   float64       // Attenuation factor for 1-hop expansion (default: 0.5)
+	FrequencyMaxCount  float64       // Access count normalisation baseline (default: 100.0)
+	NeighbourHopBoost  float64       // Attenuation factor for 1-hop expansion (default: 0.35)
 	MaxCandidatePool   int           // Max top vector seeds for graph expansion (default: 20)
 }
 
@@ -31,7 +31,7 @@ func DefaultConfig() EngineConfig {
 		DefaultGamma:      0.2,
 		DecayHalfLife:     24 * time.Hour,
 		FrequencyMaxCount: 100.0,
-		NeighborHopBoost:  0.35,
+		NeighbourHopBoost: 0.35,
 		MaxCandidatePool:  20,
 	}
 }
@@ -292,25 +292,25 @@ func (e *Engine) Recall(ctx context.Context, req model.RecallRequest) (*model.Re
 
 		for _, edge := range edges {
 			// Find which end is the seed and which is the neighbour
-			var seedID, neighborID string
+			var seedID, neighbourID string
 			seedScore := 0.0
 
 			if cs, isSource := candidates[edge.SourceID]; isSource && cs.hopDistance == 0 {
 				seedID = edge.SourceID
-				neighborID = edge.TargetID
+				neighbourID = edge.TargetID
 				seedScore = cs.totalScore
 			} else if ct, isTarget := candidates[edge.TargetID]; isTarget && ct.hopDistance == 0 {
 				seedID = edge.TargetID
-				neighborID = edge.SourceID
+				neighbourID = edge.SourceID
 				seedScore = ct.totalScore
 			}
 
-			if seedID != "" && neighborID != "" && seedID != neighborID {
-				nCand, exists := candidates[neighborID]
+			if seedID != "" && neighbourID != "" && seedID != neighbourID {
+				nCand, exists := candidates[neighbourID]
 				if exists {
-					boost := e.cfg.NeighborHopBoost * math.Min(1.0, edge.Weight) * seedScore
+					boost := e.cfg.NeighbourHopBoost * math.Min(1.0, edge.Weight) * seedScore
 					newScore := nCand.baseScore + boost
-					// A 1-hop neighbor cannot exceed the seed node that activated it
+					// A 1-hop neighbour cannot exceed the seed node that activated it
 					if nCand.baseScore < seedScore && newScore >= seedScore {
 						newScore = seedScore * 0.95
 					}

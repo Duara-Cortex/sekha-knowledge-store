@@ -96,7 +96,7 @@ func TestAPIServer_Endpoints(t *testing.T) {
 	ms := newAPIMockStore()
 	engine, err := recall.NewEngine(ctx, ms, recall.DefaultConfig())
 	if err != nil {
-		t.Fatalf("engine initialization failed: %v", err)
+		t.Fatalf("engine initialisation failed: %v", err)
 	}
 
 	server := NewServer(ms, engine, 8084)

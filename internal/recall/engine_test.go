@@ -199,7 +199,7 @@ func TestRecallEngine_WeightedRanking(t *testing.T) {
 		resp.Nodes[2].ID, resp.Nodes[2].Score, resp.Nodes[2].SimScore, resp.Nodes[2].FrequencyScore, resp.Nodes[2].RecencyScore)
 }
 
-func TestRecallEngine_OneHopNeighborExpansion(t *testing.T) {
+func TestRecallEngine_OneHopNeighbourExpansion(t *testing.T) {
 	ctx := context.Background()
 	ms := newMockStore()
 
@@ -217,7 +217,7 @@ func TestRecallEngine_OneHopNeighborExpansion(t *testing.T) {
 		StabilityScore: 1.0,
 	}
 
-	// Neighbor node B has orthogonal vector (0.0 similarity to query), but linked to node A
+	// Neighbour node B has orthogonal vector (0.0 similarity to query), but linked to node A
 	nB := model.Node{
 		ID:             "node-B",
 		EntityType:     "solution",
@@ -277,7 +277,7 @@ func TestRecallEngine_OneHopNeighborExpansion(t *testing.T) {
 		t.Fatalf("expected top node node-A, got %s", resp.Nodes[0].ID)
 	}
 	if resp.Nodes[1].ID != "node-B" {
-		t.Fatalf("expected 1-hop neighbor node-B to be boosted into top 2, got %s", resp.Nodes[1].ID)
+		t.Fatalf("expected 1-hop neighbour node-B to be boosted into top 2, got %s", resp.Nodes[1].ID)
 	}
 
 	// Subgraph edges should include the edge between A and B
