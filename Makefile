@@ -11,12 +11,8 @@ check-go:
 	@which go > /dev/null 2>&1 || (echo "ERROR: 'go' is not installed or not in PATH. Ensure Go 1.22+ is installed and in your PATH." && exit 1)
 
 resolve-deps: check-go
-	@if [ ! -f go.sum ] || ! grep -q "modernc.org/sqlite" go.sum 2>/dev/null; then \
-		echo "Resolving Go module dependencies (downloading modernc.org/sqlite pure-Go driver)..."; \
-		go mod tidy; \
-		go mod download; \
-		echo "Dependencies successfully resolved and verified."; \
-	fi
+	@go mod tidy
+	@go mod download
 
 deps: resolve-deps
 
