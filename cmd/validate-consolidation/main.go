@@ -210,10 +210,8 @@ func main() {
 		}
 	}
 
-	// Query soft-archived nodes count
-	var archivedCount int64
-	_ = sqliteStore.GetCounts(ctx)
-	archivedCount = finalStats.ArchivedNodes
+	// Query soft-archived and active nodes count from final stats
+	archivedCount := finalStats.ArchivedNodes
 	activeCount := finalStats.ActiveNodes
 
 	sort.Float64s(hubScores)
