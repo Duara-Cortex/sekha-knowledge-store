@@ -65,6 +65,11 @@ func main() {
 	nCnt, eCnt, _ := sqliteStore.GetCounts(context.Background())
 	log.Printf("[Status] Hydrated %d knowledge nodes and %d relational edges into in-memory index", nCnt, eCnt)
 
+	// Launch periodic background synchronization with SQLite store
+	syncCtx, cancelSync := context.WithCancel(context.Background())
+	defer cancelSync()
+	engine.StartBackgroundSync(syncCtx, 15*time.Second)
+
 	server := api.NewServer(sqliteStore, engine, *port)
 
 	httpServer := &http.Server{

@@ -3,10 +3,10 @@ package consolidation
 import (
 	"crypto/sha256"
 	"fmt"
-	"math"
 	"regexp"
 	"strings"
 
+	"github.com/Duara-Cortex/sekha-knowledge-store/internal/embedding"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/model"
 )
 
@@ -207,34 +207,10 @@ func (e *Extractor) extractKeywords(text string) []string {
 	return keywords
 }
 
-// generateEmbedding synthesises a deterministic, unit-normalised float32 vector
-// from text hashing to populate vector fields.
+// generateEmbedding synthesises a deterministic, unit-normalised float32 semantic vector
+// using subword, stem, and token feature projections.
 func (e *Extractor) generateEmbedding(text string) []float32 {
-	vec := make([]float32, e.vectorDims)
-	h := sha256.Sum256([]byte(text))
-
-	for i := 0; i < e.vectorDims; i++ {
-		byteVal := h[i%len(h)]
-		// Pseudo-random pseudo-Gaussian float
-		f := float32(int(byteVal)-128) / 128.0
-		// Spread non-linear harmonics
-		shift := float32(math.Sin(float64(i)*0.45 + float64(byteVal)))
-		vec[i] = f + shift
-	}
-
-	// Normalise to unit Euclidean length
-	var sum float64
-	for _, v := range vec {
-		sum += float64(v * v)
-	}
-	mag := float32(math.Sqrt(sum))
-	if mag > 0 {
-		for i := range vec {
-			vec[i] /= mag
-		}
-	}
-
-	return vec
+	return embedding.Generate(text, e.vectorDims)
 }
 
 func truncateString(s string, maxLen int) string {

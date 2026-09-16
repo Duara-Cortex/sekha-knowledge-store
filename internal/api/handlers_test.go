@@ -34,6 +34,8 @@ func (m *apiMockStore) InsertNodes(ctx context.Context, nodes []model.Node) (int
 		m.headers = append(m.headers, store.NodeHeader{
 			ID:             n.ID,
 			EntityType:     n.EntityType,
+			Label:          n.Label,
+			Summary:        n.Summary,
 			Embedding:      n.Embedding,
 			LastAccessedAt: n.LastAccessedAt,
 			AccessCount:    n.AccessCount,
@@ -258,3 +260,127 @@ func TestAPIServer_Endpoints(t *testing.T) {
 		t.Fatalf("expected status 200 on consolidation stats, got %d", rec.Code)
 	}
 }
+
+func TestAPIServer_ConsolidationRecallEndToEnd(t *testing.T) {
+	ms := newAPIMockStore()
+	ctx := context.Background()
+
+	// Engine starts with 0 nodes hydrated (empty database at boot)
+	engine, err := recall.NewEngine(ctx, ms, recall.DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed to create recall engine: %v", err)
+	}
+
+	server := NewServer(ms, engine, 8084)
+
+	// Step 1: Deliberation trace for Project Kestrel is consolidated synchronously
+	consolidatePayload := model.ConsolidateRequest{
+		TraceID:     "trace-kestrel-01",
+		SessionID:   "session-kestrel",
+		TaskGoal:    "Project Kestrel ingest service configuration",
+		Outcome:     model.OutcomeSuccess,
+		Synchronous: true,
+		Trajectory: []model.TrajectoryStep{
+			{
+				StepIndex: 1,
+				Thought:   "Configure ingest service settings for Project Kestrel",
+				Action:    "edit /etc/kestrel/config.yaml",
+				Status:    "success",
+			},
+		},
+		SensoryContext: []model.SensoryItem{
+			{
+				Text:     "Project Kestrel ingest service listening on port 8084",
+				Salience: 0.9,
+			},
+		},
+	}
+
+	body, _ := json.Marshal(consolidatePayload)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/memory/consolidate", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200 on synchronous consolidate, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var consResp model.ConsolidateResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &consResp)
+	if consResp.NodesFused == 0 && len(consResp.CreatedNodes) == 0 {
+		t.Fatalf("expected fused/created nodes, got none: %+v", consResp)
+	}
+
+	// Verify in-memory recall index has been populated (Issue B & C resolved)
+	if engine.IndexLen() == 0 {
+		t.Fatalf("expected in-memory index to contain nodes after consolidation, got 0")
+	}
+
+	// Step 2: Query recall with text query ONLY (Issue A & D resolved)
+	recallPayload := model.RecallRequest{
+		Query: "Project Kestrel ingest service settings",
+		TopK:  3,
+	}
+	body, _ = json.Marshal(recallPayload)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/memory/recall", bytes.NewReader(body))
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200 on recall, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var recResp model.RecallResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &recResp)
+	if len(recResp.Nodes) == 0 {
+		t.Fatalf("expected recall results, got empty list")
+	}
+
+	// Top result must have positive SimScore
+	topNode := recResp.Nodes[0]
+	if topNode.SimScore <= 0.5 {
+		t.Fatalf("expected strong semantic SimScore (>0.5) for matching text query, got %f", topNode.SimScore)
+	}
+	t.Logf("Top recalled node: %s | Label: %s | Sim: %f | Total: %f",
+		topNode.ID, topNode.Label, topNode.SimScore, topNode.Score)
+
+	// Step 3: Consolidate distractor trace (Issue E resolved)
+	distractorPayload := model.ConsolidateRequest{
+		TraceID:     "trace-distractor-01",
+		SessionID:   "session-distractor",
+		TaskGoal:    "Periodic cooling fan speed adjustment",
+		Outcome:     model.OutcomeSuccess,
+		Synchronous: true,
+		Trajectory: []model.TrajectoryStep{
+			{
+				StepIndex: 1,
+				Thought:   "Check thermal sensors and spin fan up to 6000 RPM",
+				Action:    "pwm_set 6000",
+				Status:    "success",
+			},
+		},
+	}
+	body, _ = json.Marshal(distractorPayload)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/memory/consolidate", bytes.NewReader(body))
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	// Query recall again for Kestrel: needle must remain #1 despite recent distractor
+	body, _ = json.Marshal(recallPayload)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/memory/recall", bytes.NewReader(body))
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	var recResp2 model.RecallResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &recResp2)
+	if len(recResp2.Nodes) == 0 {
+		t.Fatalf("expected recall results, got empty")
+	}
+
+	if recResp2.Nodes[0].SimScore <= 0.5 {
+		t.Fatalf("expected needle to stay rank 1, but got sim: %f", recResp2.Nodes[0].SimScore)
+	}
+	t.Logf("Post-distractor Rank 1: %s (sim: %f, score: %f)",
+		recResp2.Nodes[0].ID, recResp2.Nodes[0].SimScore, recResp2.Nodes[0].Score)
+}
+

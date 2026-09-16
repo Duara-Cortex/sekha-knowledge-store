@@ -30,6 +30,7 @@ type FusionResult struct {
 	EntitiesCreated  int
 	EdgesReinforced  int
 	EntityIDMappings map[string]string // trace entity ID -> canonical persistent node ID
+	CreatedNodes     []model.Node
 }
 
 // Fuse assimilates extracted entities and relationships into the persistent knowledge store.
@@ -93,6 +94,7 @@ func (f *FusionEngine) Fuse(ctx context.Context, extraction ExtractionResult, re
 		if _, err := f.store.InsertNodes(ctx, nodesToInsert); err != nil {
 			return nil, fmt.Errorf("failed persisting novel nodes during fusion: %w", err)
 		}
+		result.CreatedNodes = nodesToInsert
 	}
 
 	// 3. Reconcile and reinforce relational edges using canonical IDs
