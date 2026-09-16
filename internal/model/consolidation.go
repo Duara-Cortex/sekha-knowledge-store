@@ -76,6 +76,7 @@ type ConsolidateResponse struct {
 	EntitiesExtracted int    `json:"entities_extracted,omitempty"`
 	NodesFused        int    `json:"nodes_fused,omitempty"`
 	EdgesReinforced   int    `json:"edges_reinforced,omitempty"`
+	CreatedNodes      []Node `json:"created_nodes,omitempty"`
 }
 
 // ExtractedEntity represents a salient concept, decision, or entity derived from an episodic trace.

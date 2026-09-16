@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/Duara-Cortex/sekha-knowledge-store/internal/embedding"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/model"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/store"
 )
@@ -21,6 +23,7 @@ type EngineConfig struct {
 	FrequencyMaxCount  float64       // Access count normalisation baseline (default: 100.0)
 	NeighbourHopBoost  float64       // Attenuation factor for 1-hop expansion (default: 0.35)
 	MaxCandidatePool   int           // Max top vector seeds for graph expansion (default: 20)
+	VectorDims         int           // Dimensionality for dynamic query embeddings (default: 64)
 }
 
 // DefaultConfig provides balanced cognitive recall defaults.
@@ -33,12 +36,15 @@ func DefaultConfig() EngineConfig {
 		FrequencyMaxCount: 100.0,
 		NeighbourHopBoost: 0.35,
 		MaxCandidatePool:  20,
+		VectorDims:        64,
 	}
 }
 
 type cachedNode struct {
 	id             string
 	entityType     string
+	label          string
+	summary        string
 	embedding      []float32
 	magnitude      float32
 	lastAccessedAt time.Time
@@ -94,6 +100,8 @@ func (e *Engine) Hydrate(ctx context.Context) error {
 		cn := &cachedNode{
 			id:             h.ID,
 			entityType:     h.EntityType,
+			label:          h.Label,
+			summary:        h.Summary,
 			embedding:      h.Embedding,
 			magnitude:      h.Magnitude,
 			lastAccessedAt: h.LastAccessedAt,
@@ -139,6 +147,8 @@ func (e *Engine) RegisterNodes(nodes []model.Node) {
 		cn, exists := e.nodes[n.ID]
 		if exists {
 			cn.entityType = n.EntityType
+			cn.label = n.Label
+			cn.summary = n.Summary
 			if len(n.Embedding) > 0 {
 				cn.embedding = n.Embedding
 				cn.magnitude = mag
@@ -148,6 +158,8 @@ func (e *Engine) RegisterNodes(nodes []model.Node) {
 			cn = &cachedNode{
 				id:             n.ID,
 				entityType:     n.EntityType,
+				label:          n.Label,
+				summary:        n.Summary,
 				embedding:      n.Embedding,
 				magnitude:      mag,
 				lastAccessedAt: n.LastAccessedAt,
@@ -203,6 +215,34 @@ func (e *Engine) Recall(ctx context.Context, req model.RecallRequest) (*model.Re
 		alpha, beta, gamma = 0.6, 0.2, 0.2
 	}
 
+	// Rehydrate in-memory index if empty (e.g. SQLite had 0 nodes at startup or nodes added externally)
+	e.mu.RLock()
+	indexLen := len(e.index)
+	e.mu.RUnlock()
+	if indexLen == 0 {
+		_ = e.Hydrate(ctx)
+	}
+
+	queryText := strings.TrimSpace(req.Query)
+	var queryTokens []string
+	if queryText != "" {
+		queryTokens = embedding.ExtractTokens(queryText)
+	}
+
+	// If embedding was not provided but query text was passed, dynamically generate semantic vector
+	if len(req.Embedding) == 0 && queryText != "" {
+		dims := e.cfg.VectorDims
+		if dims <= 0 {
+			dims = 64
+		}
+		e.mu.RLock()
+		if len(e.index) > 0 && len(e.index[0].embedding) > 0 {
+			dims = len(e.index[0].embedding)
+		}
+		e.mu.RUnlock()
+		req.Embedding = embedding.Generate(queryText, dims)
+	}
+
 	// Compute query embedding magnitude
 	var queryMag float32
 	if len(req.Embedding) > 0 {
@@ -225,22 +265,41 @@ func (e *Engine) Recall(ctx context.Context, req model.RecallRequest) (*model.Re
 	var scoredList []*candidateScore
 
 	for _, cn := range e.index {
-		// 1. Semantic Vector Similarity: Sim(q, embedding)
+		// 1. Semantic Similarity: Sim(q, node)
 		var simScore float64
 		if req.EntityID != "" && cn.id == req.EntityID {
 			simScore = 1.0
-		} else if queryMag > 0 && cn.magnitude > 0 && len(req.Embedding) == len(cn.embedding) {
-			var dot float64
-			for i := range req.Embedding {
-				dot += float64(req.Embedding[i] * cn.embedding[i])
+		} else {
+			// 1a. Vector Cosine Similarity
+			var vecSim float64
+			if queryMag > 0 && cn.magnitude > 0 && len(req.Embedding) == len(cn.embedding) {
+				var dot float64
+				for i := range req.Embedding {
+					dot += float64(req.Embedding[i] * cn.embedding[i])
+				}
+				cosine := dot / (float64(queryMag) * float64(cn.magnitude))
+				if cosine > 1.0 {
+					cosine = 1.0
+				} else if cosine < 0.0 {
+					cosine = 0.0
+				}
+				vecSim = cosine
 			}
-			cosine := dot / (float64(queryMag) * float64(cn.magnitude))
-			if cosine > 1.0 {
-				cosine = 1.0
-			} else if cosine < 0.0 {
-				cosine = 0.0
+
+			// 1b. Lexical & Keyword Matching against node label and summary
+			var lexSim float64
+			if len(queryTokens) > 0 {
+				lexSim = embedding.ScoreLexical(queryTokens, cn.label, cn.summary)
 			}
-			simScore = cosine
+
+			// Composite semantic signal: vector similarity + lexical overlap
+			if vecSim > 0 && lexSim > 0 {
+				simScore = 0.65*vecSim + 0.35*lexSim
+			} else if vecSim > 0 {
+				simScore = vecSim
+			} else {
+				simScore = lexSim
+			}
 		}
 
 		// 2. Usage Frequency: log(1 + access_count)
@@ -438,3 +497,53 @@ func (e *Engine) recordAccess(ctx context.Context, ids []string, accessTime time
 		_ = e.store.RecordAccess(bgCtx, ids, accessTime)
 	}()
 }
+
+// IndexLen returns the current number of active cached nodes in memory.
+func (e *Engine) IndexLen() int {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return len(e.index)
+}
+
+// Sync compares the active node count in SQLite with the in-memory cache
+// and re-hydrates if external processes or background jobs inserted new nodes.
+func (e *Engine) Sync(ctx context.Context) error {
+	activeCount, _, err := e.store.GetCounts(ctx)
+	if err != nil {
+		return err
+	}
+
+	e.mu.RLock()
+	currentCount := int64(len(e.index))
+	e.mu.RUnlock()
+
+	if activeCount != currentCount {
+		return e.Hydrate(ctx)
+	}
+	return nil
+}
+
+// StartBackgroundSync periodically checks SQLite for newly consolidated or modified nodes
+// and synchronises the in-memory recall index.
+func (e *Engine) StartBackgroundSync(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = 15 * time.Second
+	}
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				syncCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = e.Sync(syncCtx)
+				cancel()
+			}
+		}
+	}()
+}
+

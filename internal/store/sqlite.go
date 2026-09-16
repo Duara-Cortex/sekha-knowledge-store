@@ -418,7 +418,7 @@ func (s *SQLiteStore) GetNodes(ctx context.Context, ids []string) (map[string]mo
 // GetAllNodeHeaders scans lightweight headers and embeddings for in-memory indexing of active nodes.
 func (s *SQLiteStore) GetAllNodeHeaders(ctx context.Context) ([]NodeHeader, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, entity_type, embedding, last_accessed_at, access_count, stability_score, is_archived
+		SELECT id, entity_type, label, summary, embedding, last_accessed_at, access_count, stability_score, is_archived
 		FROM nodes
 		WHERE is_archived = 0
 	`)
@@ -437,6 +437,8 @@ func (s *SQLiteStore) GetAllNodeHeaders(ctx context.Context) ([]NodeHeader, erro
 		if err := rows.Scan(
 			&h.ID,
 			&h.EntityType,
+			&h.Label,
+			&h.Summary,
 			&blob,
 			&accessedStr,
 			&h.AccessCount,

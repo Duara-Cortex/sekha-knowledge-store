@@ -2,6 +2,7 @@ package recall
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -39,6 +40,8 @@ func (m *mockStore) InsertNodes(ctx context.Context, nodes []model.Node) (int, e
 		m.headers = append(m.headers, store.NodeHeader{
 			ID:             n.ID,
 			EntityType:     n.EntityType,
+			Label:          n.Label,
+			Summary:        n.Summary,
 			Embedding:      n.Embedding,
 			Magnitude:      mag,
 			LastAccessedAt: n.LastAccessedAt,
@@ -328,3 +331,192 @@ func TestRecallEngine_OneHopNeighbourExpansion(t *testing.T) {
 		t.Fatalf("unexpected edge relation: %s", resp.Edges[0].RelationType)
 	}
 }
+
+func TestRecallEngine_QueryTextSemanticRetrieval(t *testing.T) {
+	ctx := context.Background()
+	ms := newMockStore()
+
+	now := time.Now().UTC()
+	// Node 1: Project Kestrel settings
+	n1 := model.Node{
+		ID:             "needle-kestrel",
+		EntityType:     "decision",
+		Label:          "Project Kestrel ingest service settings",
+		Summary:        "Configured ingest service parameters and port bindings for Project Kestrel",
+		CreatedAt:      now.Add(-48 * time.Hour),
+		LastAccessedAt: now.Add(-48 * time.Hour),
+		AccessCount:    1,
+		StabilityScore: 1.0,
+	}
+
+	// Node 2: Unrelated recent node
+	n2 := model.Node{
+		ID:             "distractor-recent",
+		EntityType:     "telemetry",
+		Label:          "Camera frame dropped",
+		Summary:        "Optical sensor buffer overflow on video stream",
+		CreatedAt:      now.Add(-1 * time.Minute),
+		LastAccessedAt: now.Add(-1 * time.Minute),
+		AccessCount:    50,
+		StabilityScore: 1.0,
+	}
+
+	_, _ = ms.InsertNodes(ctx, []model.Node{n1, n2})
+
+	engine, err := NewEngine(ctx, ms, DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	// Query with text string ONLY (no precomputed embedding)
+	req := model.RecallRequest{
+		Query:      "Project Kestrel ingest service settings",
+		TopK:       2,
+		Alpha:      0.6,
+		Beta:       0.2,
+		Gamma:      0.2,
+		ExpandHops: 0,
+	}
+
+	resp, err := engine.Recall(ctx, req)
+	if err != nil {
+		t.Fatalf("recall with query text failed: %v", err)
+	}
+
+	if len(resp.Nodes) == 0 {
+		t.Fatalf("expected returned nodes, got 0")
+	}
+
+	// The needle should rank #1 despite being 48h older and having only 1 access
+	if resp.Nodes[0].ID != "needle-kestrel" {
+		t.Fatalf("expected needle-kestrel to rank first, got %s (score: %f vs %f)",
+			resp.Nodes[0].ID, resp.Nodes[0].Score, resp.Nodes[1].Score)
+	}
+
+	if resp.Nodes[0].SimScore <= 0.7 {
+		t.Fatalf("expected high SimScore for semantic text match, got %f", resp.Nodes[0].SimScore)
+	}
+
+	t.Logf("Rank 1: %s (sim: %f, score: %f)", resp.Nodes[0].ID, resp.Nodes[0].SimScore, resp.Nodes[0].Score)
+	t.Logf("Rank 2: %s (sim: %f, score: %f)", resp.Nodes[1].ID, resp.Nodes[1].SimScore, resp.Nodes[1].Score)
+}
+
+func TestRecallEngine_EmptyIndexHydration(t *testing.T) {
+	ctx := context.Background()
+	ms := newMockStore()
+
+	// Engine starts with 0 nodes in store
+	engine, err := NewEngine(ctx, ms, DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	if engine.IndexLen() != 0 {
+		t.Fatalf("expected initial index length 0, got %d", engine.IndexLen())
+	}
+
+	// Now nodes are inserted into SQLite store externally
+	now := time.Now().UTC()
+	_, _ = ms.InsertNodes(ctx, []model.Node{
+		{
+			ID:             "external-node-1",
+			EntityType:     "concept",
+			Label:          "Edge cluster coordination",
+			Summary:        "Leader election protocol",
+			CreatedAt:      now,
+			LastAccessedAt: now,
+			AccessCount:    5,
+			StabilityScore: 1.0,
+		},
+	})
+
+	// Query recall: should automatically rehydrate the empty index from store
+	req := model.RecallRequest{
+		Query: "coordination",
+		TopK:  5,
+	}
+
+	resp, err := engine.Recall(ctx, req)
+	if err != nil {
+		t.Fatalf("recall failed: %v", err)
+	}
+
+	if len(resp.Nodes) != 1 {
+		t.Fatalf("expected 1 node returned after empty index auto-hydration, got %d", len(resp.Nodes))
+	}
+
+	if resp.Nodes[0].ID != "external-node-1" {
+		t.Fatalf("expected external-node-1, got %s", resp.Nodes[0].ID)
+	}
+}
+
+func TestRecallEngine_OvercomesRecencyTrap(t *testing.T) {
+	ctx := context.Background()
+	ms := newMockStore()
+
+	now := time.Now().UTC()
+	// Target needle: 7 days old, low access count
+	needle := model.Node{
+		ID:             "needle-kestrel",
+		EntityType:     "decision",
+		Label:          "Kestrel Ingest Service Port",
+		Summary:        "Default port 8084 assigned to kestrel ingest daemon",
+		CreatedAt:      now.Add(-7 * 24 * time.Hour),
+		LastAccessedAt: now.Add(-7 * 24 * time.Hour),
+		AccessCount:    1,
+		StabilityScore: 1.0,
+	}
+
+	// 5 recent distractor nodes consolidated afterwards (1 minute ago)
+	distractors := make([]model.Node, 5)
+	for i := 0; i < 5; i++ {
+		distractors[i] = model.Node{
+			ID:             fmt.Sprintf("distractor-%d", i+1),
+			EntityType:     "telemetry",
+			Label:          fmt.Sprintf("Distractor Sensor Event #%d", i+1),
+			Summary:        fmt.Sprintf("Routine periodic sensor reading #%d", i+1),
+			CreatedAt:      now.Add(-time.Duration(i+1) * time.Minute),
+			LastAccessedAt: now.Add(-time.Duration(i+1) * time.Minute),
+			AccessCount:    int64(20 + i*10),
+			StabilityScore: 1.0,
+		}
+	}
+
+	allNodes := append([]model.Node{needle}, distractors...)
+	_, _ = ms.InsertNodes(ctx, allNodes)
+
+	engine, err := NewEngine(ctx, ms, DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	// Recall query for the needle using natural text
+	req := model.RecallRequest{
+		Query: "kestrel ingest service port",
+		TopK:  3,
+		Alpha: 0.6,
+		Beta:  0.2,
+		Gamma: 0.2,
+	}
+
+	resp, err := engine.Recall(ctx, req)
+	if err != nil {
+		t.Fatalf("recall failed: %v", err)
+	}
+
+	if len(resp.Nodes) == 0 {
+		t.Fatalf("expected results, got empty")
+	}
+
+	// Needle MUST be rank 1, overcoming the recency and frequency bias of distractors
+	if resp.Nodes[0].ID != "needle-kestrel" {
+		t.Fatalf("recency trap occurred: expected needle-kestrel at rank 1, but got %s (score %f vs needle %f)",
+			resp.Nodes[0].ID, resp.Nodes[0].Score, resp.Nodes[1].Score)
+	}
+
+	t.Logf("Needle score: %f (sim: %f, recency: %f)",
+		resp.Nodes[0].Score, resp.Nodes[0].SimScore, resp.Nodes[0].RecencyScore)
+	t.Logf("Distractor score: %f (sim: %f, recency: %f)",
+		resp.Nodes[1].Score, resp.Nodes[1].SimScore, resp.Nodes[1].RecencyScore)
+}
+

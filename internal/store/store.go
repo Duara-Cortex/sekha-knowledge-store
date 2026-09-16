@@ -11,6 +11,8 @@ import (
 type NodeHeader struct {
 	ID             string
 	EntityType     string
+	Label          string
+	Summary        string
 	Embedding      []float32
 	Magnitude      float32
 	LastAccessedAt time.Time

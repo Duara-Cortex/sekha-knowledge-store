@@ -11,15 +11,41 @@ import (
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/store"
 )
 
+// NodeListener is invoked when new nodes are created during consolidation.
+type NodeListener func([]model.Node)
+
 // Engine orchestrates the periodic background consolidation cycle, Hebbian reinforcement,
 // mathematical recency decay, and soft-archiving routines.
 type Engine struct {
-	store     store.Store
-	extractor *Extractor
-	fusion    *FusionEngine
-	config    model.DecayConfig
-	mu        sync.RWMutex
-	stats     model.ConsolidationStats
+	store         store.Store
+	extractor     *Extractor
+	fusion        *FusionEngine
+	config        model.DecayConfig
+	mu            sync.RWMutex
+	stats         model.ConsolidationStats
+	listenerMu    sync.RWMutex
+	nodeListeners []NodeListener
+}
+
+// AddNodeListener registers a listener to be notified whenever new nodes are fused.
+func (e *Engine) AddNodeListener(l NodeListener) {
+	e.listenerMu.Lock()
+	defer e.listenerMu.Unlock()
+	e.nodeListeners = append(e.nodeListeners, l)
+}
+
+func (e *Engine) notifyNodeListeners(nodes []model.Node) {
+	if len(nodes) == 0 {
+		return
+	}
+	e.listenerMu.RLock()
+	listeners := make([]NodeListener, len(e.nodeListeners))
+	copy(listeners, e.nodeListeners)
+	e.listenerMu.RUnlock()
+
+	for _, l := range listeners {
+		l(nodes)
+	}
 }
 
 // NewEngine initialises the consolidation engine with SQLite storage and decay parameters.
@@ -85,6 +111,9 @@ func (e *Engine) IngestTrace(ctx context.Context, req model.ConsolidateRequest) 
 		resp.EntitiesExtracted = len(extracted.Entities)
 		resp.NodesFused = fusionRes.EntitiesFused + fusionRes.EntitiesCreated
 		resp.EdgesReinforced = fusionRes.EdgesReinforced
+		resp.CreatedNodes = fusionRes.CreatedNodes
+
+		e.notifyNodeListeners(fusionRes.CreatedNodes)
 	}
 
 	return resp, nil
@@ -114,6 +143,7 @@ func (e *Engine) RunConsolidationCycle(ctx context.Context, refTime time.Time) (
 	totalEntitiesExtracted := 0
 	totalNodesFused := 0
 	totalEdgesReinforced := 0
+	var cycleCreatedNodes []model.Node
 
 	// 2. Fuse pending traces into knowledge graph
 	for _, trace := range pendingTraces {
@@ -133,10 +163,17 @@ func (e *Engine) RunConsolidationCycle(ctx context.Context, refTime time.Time) (
 
 		totalNodesFused += (fusionRes.EntitiesFused + fusionRes.EntitiesCreated)
 		totalEdgesReinforced += fusionRes.EdgesReinforced
+		if len(fusionRes.CreatedNodes) > 0 {
+			cycleCreatedNodes = append(cycleCreatedNodes, fusionRes.CreatedNodes...)
+		}
 
 		if err := e.store.MarkTraceConsolidated(ctx, trace.ID, refTime); err != nil {
 			log.Printf("[Consolidation] Error marking trace %s consolidated: %v", trace.ID, err)
 		}
+	}
+
+	if len(cycleCreatedNodes) > 0 {
+		e.notifyNodeListeners(cycleCreatedNodes)
 	}
 
 	// 3. Evaluate exponential recency decay and soft-archival / pruning

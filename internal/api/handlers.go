@@ -23,10 +23,15 @@ type Server struct {
 
 // NewServer builds and registers all API routes for port 8084.
 func NewServer(s store.Store, e *recall.Engine, port int) *Server {
+	ce := consolidation.NewEngine(s, model.DefaultDecayConfig())
+	ce.AddNodeListener(func(nodes []model.Node) {
+		e.RegisterNodes(nodes)
+	})
+
 	srv := &Server{
 		store:               s,
 		engine:              e,
-		consolidationEngine: consolidation.NewEngine(s, model.DefaultDecayConfig()),
+		consolidationEngine: ce,
 		mux:                 http.NewServeMux(),
 		startTime:           time.Now(),
 		port:                port,
@@ -39,6 +44,9 @@ func NewServer(s store.Store, e *recall.Engine, port int) *Server {
 func (s *Server) SetConsolidationEngine(ce *consolidation.Engine) {
 	if ce != nil {
 		s.consolidationEngine = ce
+		s.consolidationEngine.AddNodeListener(func(nodes []model.Node) {
+			s.engine.RegisterNodes(nodes)
+		})
 	}
 }
 
@@ -191,6 +199,11 @@ func (s *Server) handleConsolidate(w http.ResponseWriter, r *http.Request) {
 			Message: "trace consolidation failed: " + err.Error(),
 		})
 		return
+	}
+
+	// Register novel consolidated nodes directly with in-memory recall index
+	if len(resp.CreatedNodes) > 0 {
+		s.engine.RegisterNodes(resp.CreatedNodes)
 	}
 
 	if resp.Synchronous {
