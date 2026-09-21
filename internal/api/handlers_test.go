@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -131,7 +133,20 @@ func (m *apiMockStore) GetAllNodeHeaders(ctx context.Context) ([]store.NodeHeade
 }
 
 func (m *apiMockStore) GetEdgesForNodes(ctx context.Context, nodeIDs []string) ([]model.Edge, error) {
-	return m.edges, nil
+	if len(nodeIDs) == 0 {
+		return nil, nil
+	}
+	idMap := make(map[string]bool, len(nodeIDs))
+	for _, id := range nodeIDs {
+		idMap[id] = true
+	}
+	var res []model.Edge
+	for _, e := range m.edges {
+		if idMap[e.SourceID] || idMap[e.TargetID] {
+			res = append(res, e)
+		}
+	}
+	return res, nil
 }
 
 func (m *apiMockStore) RecordAccess(ctx context.Context, nodeIDs []string, accessTime time.Time) error {
@@ -597,5 +612,426 @@ func TestAPIServer_AnchorBoostAndFilter(t *testing.T) {
 		if !found {
 			t.Fatalf("expected node %s to have #pattern:circuit-breaker, got %v", n.ID, n.Anchors)
 		}
+	}
+}
+
+func generate64DimVector(seed int) []float32 {
+	vec := make([]float32, 64)
+	var sum float64
+	for i := 0; i < 64; i++ {
+		// Generate varied fractional float32 values
+		v := float32(math.Sin(float64(seed*67 + i*31)))
+		vec[i] = v
+		sum += float64(v * v)
+	}
+	mag := float32(math.Sqrt(sum))
+	if mag > 0 {
+		for i := 0; i < 64; i++ {
+			vec[i] /= mag
+		}
+	}
+	return vec
+}
+
+func TestRecall_EmbeddingOmissionByDefaultAndFlag(t *testing.T) {
+	ctx := context.Background()
+	ms := newAPIMockStore()
+	engine, err := recall.NewEngine(ctx, ms, recall.DefaultConfig())
+	if err != nil {
+		t.Fatalf("engine initialisation failed: %v", err)
+	}
+	server := NewServer(ms, engine, 8084)
+
+	vec64 := generate64DimVector(42)
+	node := model.Node{
+		ID:             "node-emb-test",
+		EntityType:     "concept",
+		Label:          "Embedding Test Node",
+		Summary:        "Node with 64-dimensional float vector",
+		Embedding:      vec64,
+		CreatedAt:      time.Now(),
+		LastAccessedAt: time.Now(),
+		AccessCount:    10,
+		StabilityScore: 1.0,
+	}
+	_, _ = ms.InsertNodes(ctx, []model.Node{node})
+	engine.RegisterNodes([]model.Node{node})
+
+	// 1. Default (include_embeddings=false): raw float vector MUST be omitted
+	recallReq := model.RecallRequest{
+		Query: "Embedding Test Node",
+		TopK:  1,
+	}
+	body, _ := json.Marshal(recallReq)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/memory/recall", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("recall failed with status %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Verify in typed RecallResponse that Embedding is nil / empty
+	var respDefault model.RecallResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &respDefault)
+	if len(respDefault.Nodes) == 0 {
+		t.Fatalf("expected recalled node, got 0")
+	}
+	if len(respDefault.Nodes[0].Embedding) != 0 {
+		t.Fatalf("expected nil/empty embedding by default, got %d elements", len(respDefault.Nodes[0].Embedding))
+	}
+
+	// Verify in raw JSON map that "embedding" key is completely omitted
+	var rawMapDefault map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &rawMapDefault)
+	nodesList, ok := rawMapDefault["nodes"].([]any)
+	if !ok || len(nodesList) == 0 {
+		t.Fatalf("failed parsing nodes in raw response: %+v", rawMapDefault)
+	}
+	nodeObj := nodesList[0].(map[string]any)
+	if _, hasEmb := nodeObj["embedding"]; hasEmb {
+		t.Fatalf("expected 'embedding' key to be omitted from JSON by default, but it was present: %+v", nodeObj)
+	}
+
+	// 2. Explicit include_embeddings=true in JSON body: raw 64-D float vector MUST be returned
+	recallReqTrue := model.RecallRequest{
+		Query:             "Embedding Test Node",
+		TopK:              1,
+		IncludeEmbeddings: true,
+	}
+	body, _ = json.Marshal(recallReqTrue)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/memory/recall", bytes.NewReader(body))
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("recall with include_embeddings=true failed with status %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var respTrue model.RecallResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &respTrue)
+	if len(respTrue.Nodes) == 0 {
+		t.Fatalf("expected recalled node, got 0")
+	}
+	if len(respTrue.Nodes[0].Embedding) != 64 {
+		t.Fatalf("expected complete 64-D vector when include_embeddings=true, got %d elements", len(respTrue.Nodes[0].Embedding))
+	}
+
+	var rawMapTrue map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &rawMapTrue)
+	nodeObjTrue := rawMapTrue["nodes"].([]any)[0].(map[string]any)
+	embRaw, hasEmb := nodeObjTrue["embedding"]
+	if !hasEmb {
+		t.Fatalf("expected 'embedding' key to be present in JSON when include_embeddings=true")
+	}
+	embArr, isArr := embRaw.([]any)
+	if !isArr || len(embArr) != 64 {
+		t.Fatalf("expected 64 elements in raw JSON embedding, got %v", embRaw)
+	}
+
+	// 3. URL query parameter ?include_embeddings=true
+	body, _ = json.Marshal(recallReq)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/memory/recall?include_embeddings=true", bytes.NewReader(body))
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("recall with query param failed: %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var respQueryParam model.RecallResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &respQueryParam)
+	if len(respQueryParam.Nodes[0].Embedding) != 64 {
+		t.Fatalf("expected 64-D vector via query param, got %d", len(respQueryParam.Nodes[0].Embedding))
+	}
+}
+
+func TestRecall_FieldProjection(t *testing.T) {
+	ctx := context.Background()
+	ms := newAPIMockStore()
+	engine, err := recall.NewEngine(ctx, ms, recall.DefaultConfig())
+	if err != nil {
+		t.Fatalf("engine initialisation failed: %v", err)
+	}
+	server := NewServer(ms, engine, 8084)
+
+	vec64 := generate64DimVector(101)
+	node := model.Node{
+		ID:             "node-projection-test",
+		EntityType:     "decision",
+		Label:          "Buffer Allocation Strategy",
+		Summary:        "Fixed ring-buffer with sliding window eviction",
+		Embedding:      vec64,
+		Anchors:        []string{"#layer:memory"},
+		CreatedAt:      time.Now(),
+		LastAccessedAt: time.Now(),
+		AccessCount:    25,
+		StabilityScore: 0.95,
+	}
+	_, _ = ms.InsertNodes(ctx, []model.Node{node})
+	engine.RegisterNodes([]model.Node{node})
+
+	// 1. Projection with fields=["id", "label", "score"] in JSON body
+	recallReq := model.RecallRequest{
+		Query:  "Buffer Allocation Strategy",
+		TopK:   1,
+		Fields: []string{"id", "label", "score"},
+	}
+	body, _ := json.Marshal(recallReq)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/memory/recall", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var rawMap map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &rawMap)
+	nodeObj := rawMap["nodes"].([]any)[0].(map[string]any)
+
+	// Assert that ONLY projected fields exist (id, label, score)
+	expectedKeys := map[string]bool{"id": true, "label": true, "score": true}
+	for k := range nodeObj {
+		if !expectedKeys[k] {
+			t.Fatalf("unexpected projected field '%s' present in node: %+v", k, nodeObj)
+		}
+	}
+	if len(nodeObj) != 3 {
+		t.Fatalf("expected exactly 3 fields, got %d: %+v", len(nodeObj), nodeObj)
+	}
+	if nodeObj["id"] != "node-projection-test" {
+		t.Fatalf("expected id 'node-projection-test', got %v", nodeObj["id"])
+	}
+	if nodeObj["label"] != "Buffer Allocation Strategy" {
+		t.Fatalf("expected label 'Buffer Allocation Strategy', got %v", nodeObj["label"])
+	}
+	if _, hasScore := nodeObj["score"]; !hasScore {
+		t.Fatalf("expected 'score' field in projected node")
+	}
+
+	// 2. Projection with fields as comma-separated string in query parameter: ?fields=id,label,score
+	recallReqBase := model.RecallRequest{
+		Query: "Buffer Allocation Strategy",
+		TopK:  1,
+	}
+	body, _ = json.Marshal(recallReqBase)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/memory/recall?fields=id,label,score", bytes.NewReader(body))
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var rawMapQuery map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &rawMapQuery)
+	nodeObjQuery := rawMapQuery["nodes"].([]any)[0].(map[string]any)
+	if len(nodeObjQuery) != 3 {
+		t.Fatalf("expected exactly 3 fields from query param projection, got %d: %+v", len(nodeObjQuery), nodeObjQuery)
+	}
+	for k := range nodeObjQuery {
+		if !expectedKeys[k] {
+			t.Fatalf("unexpected field '%s' in query param projection: %+v", k, nodeObjQuery)
+		}
+	}
+
+	// 3. Projection with fields as comma-separated string in JSON body: {"fields": "id,label,score"}
+	rawJSONBody := []byte(`{"query": "Buffer Allocation Strategy", "top_k": 1, "fields": "id,label,score"}`)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/memory/recall", bytes.NewReader(rawJSONBody))
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var rawMapStringField map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &rawMapStringField)
+	nodeObjStringField := rawMapStringField["nodes"].([]any)[0].(map[string]any)
+	if len(nodeObjStringField) != 3 {
+		t.Fatalf("expected exactly 3 fields from string field projection, got %d: %+v", len(nodeObjStringField), nodeObjStringField)
+	}
+
+	// 4. Projection with 5 fields: ["id", "label", "summary", "anchors", "score"]
+	recallReq5 := model.RecallRequest{
+		Query:  "Buffer Allocation Strategy",
+		TopK:   1,
+		Fields: []string{"id", "label", "summary", "anchors", "score"},
+	}
+	body, _ = json.Marshal(recallReq5)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/memory/recall", bytes.NewReader(body))
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var rawMap5 map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &rawMap5)
+	nodeObj5 := rawMap5["nodes"].([]any)[0].(map[string]any)
+	if len(nodeObj5) != 5 {
+		t.Fatalf("expected 5 fields, got %d: %+v", len(nodeObj5), nodeObj5)
+	}
+	expected5 := map[string]bool{"id": true, "label": true, "summary": true, "anchors": true, "score": true}
+	for k := range nodeObj5 {
+		if !expected5[k] {
+			t.Fatalf("unexpected field '%s' in 5-field projection: %+v", k, nodeObj5)
+		}
+	}
+
+	// 5. Projection explicitly requesting embedding: ["id", "embedding"]
+	recallReqEmb := model.RecallRequest{
+		Query:  "Buffer Allocation Strategy",
+		TopK:   1,
+		Fields: []string{"id", "embedding"},
+	}
+	body, _ = json.Marshal(recallReqEmb)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/memory/recall", bytes.NewReader(body))
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var rawMapEmb map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &rawMapEmb)
+	nodeObjEmb := rawMapEmb["nodes"].([]any)[0].(map[string]any)
+	if len(nodeObjEmb) != 2 {
+		t.Fatalf("expected 2 fields (id, embedding), got %d: %+v", len(nodeObjEmb), nodeObjEmb)
+	}
+	if _, hasEmb := nodeObjEmb["embedding"]; !hasEmb {
+		t.Fatalf("expected 'embedding' field when explicitly requested in fields projection")
+	}
+}
+
+func TestRecall_PayloadSizeBenchmark(t *testing.T) {
+	ctx := context.Background()
+	ms := newAPIMockStore()
+	engine, err := recall.NewEngine(ctx, ms, recall.DefaultConfig())
+	if err != nil {
+		t.Fatalf("engine initialisation failed: %v", err)
+	}
+	server := NewServer(ms, engine, 8084)
+
+	now := time.Now().UTC()
+	var testNodes []model.Node
+	for i := 1; i <= 30; i++ {
+		vec := generate64DimVector(i * 13)
+		testNodes = append(testNodes, model.Node{
+			ID:             fmt.Sprintf("node-bench-%03d", i),
+			EntityType:     "concept",
+			Label:          fmt.Sprintf("Entity #%d Buffer", i),
+			Summary:        fmt.Sprintf("State replication config for node #%d.", i),
+			Anchors:        []string{"#kestrel"},
+			Embedding:      vec,
+			CreatedAt:      now.Add(-time.Duration(i) * time.Hour),
+			LastAccessedAt: now.Add(-time.Duration(i) * time.Minute),
+			AccessCount:    int64(10 + i*2),
+			StabilityScore: 0.9,
+		})
+	}
+	_, _ = ms.InsertNodes(ctx, testNodes)
+	engine.RegisterNodes(testNodes)
+
+	// Ingest edges connecting consecutive nodes
+	var testEdges []model.Edge
+	for i := 1; i < len(testNodes); i++ {
+		testEdges = append(testEdges, model.Edge{
+			SourceID:     testNodes[i-1].ID,
+			TargetID:     testNodes[i].ID,
+			RelationType: "communicates_with",
+			Weight:       0.8,
+			CreatedAt:    now,
+		})
+	}
+	_, _ = ms.InsertEdges(ctx, testEdges)
+
+	const queryCount = 100
+	var totalPayloadBaseline int
+	var totalPayloadStripped int
+	var maxStrippedPayload int
+	var minStrippedPayload = 999999999
+
+	for i := 0; i < queryCount; i++ {
+		queryTopic := fmt.Sprintf("Entity #%d Buffer", (i%25)+1)
+
+		// 1. Query with include_embeddings=true (baseline representation: ~19–21 KB for 18 nodes)
+		reqTrue := model.RecallRequest{
+			Query:             queryTopic,
+			TopK:              18,
+			IncludeEmbeddings: true,
+		}
+		bodyTrue, _ := json.Marshal(reqTrue)
+		httpReqTrue := httptest.NewRequest(http.MethodPost, "/api/v1/memory/recall", bytes.NewReader(bodyTrue))
+		recTrue := httptest.NewRecorder()
+		server.ServeHTTP(recTrue, httpReqTrue)
+		if recTrue.Code != http.StatusOK {
+			t.Fatalf("baseline recall query %d failed: %d", i, recTrue.Code)
+		}
+		sizeBaseline := recTrue.Body.Len()
+		totalPayloadBaseline += sizeBaseline
+
+		// 2. Query with include_embeddings=false (default: raw float vectors stripped, < 2 KB)
+		reqFalse := model.RecallRequest{
+			Query: queryTopic,
+			TopK:  5, // standard default top-k
+		}
+		bodyFalse, _ := json.Marshal(reqFalse)
+		httpReqFalse := httptest.NewRequest(http.MethodPost, "/api/v1/memory/recall", bytes.NewReader(bodyFalse))
+		recFalse := httptest.NewRecorder()
+		server.ServeHTTP(recFalse, httpReqFalse)
+		if recFalse.Code != http.StatusOK {
+			t.Fatalf("stripped recall query %d failed: %d", i, recFalse.Code)
+		}
+		sizeStripped := recFalse.Body.Len()
+		totalPayloadStripped += sizeStripped
+
+		if sizeStripped > maxStrippedPayload {
+			maxStrippedPayload = sizeStripped
+		}
+		if sizeStripped < minStrippedPayload {
+			minStrippedPayload = sizeStripped
+		}
+
+		// Individual query assertion: response payload size MUST be < 2 KB (2048 bytes)
+		if sizeStripped >= 2048 {
+			t.Fatalf("query %d: stripped response payload size %d bytes exceeded 2 KB threshold. Body:\n%s", i, sizeStripped, recFalse.Body.String())
+		}
+
+		// 3. Query with field projection schema (fields=["id", "label", "summary", "score"])
+		reqProj := model.RecallRequest{
+			Query:  queryTopic,
+			TopK:   10,
+			Fields: []string{"id", "label", "summary", "score"},
+		}
+		bodyProj, _ := json.Marshal(reqProj)
+		httpReqProj := httptest.NewRequest(http.MethodPost, "/api/v1/memory/recall", bytes.NewReader(bodyProj))
+		recProj := httptest.NewRecorder()
+		server.ServeHTTP(recProj, httpReqProj)
+		if recProj.Code != http.StatusOK {
+			t.Fatalf("projected recall query %d failed: %d", i, recProj.Code)
+		}
+		sizeProj := recProj.Body.Len()
+		if sizeProj >= 2048 {
+			t.Fatalf("query %d: projected response payload size %d bytes exceeded 2 KB threshold", i, sizeProj)
+		}
+	}
+
+	avgBaselineKB := float64(totalPayloadBaseline) / float64(queryCount) / 1024.0
+	avgStrippedKB := float64(totalPayloadStripped) / float64(queryCount) / 1024.0
+
+	t.Logf("================================================================")
+	t.Logf("    RECALL PAYLOAD BENCHMARK (100 QUERIES EMPIRICAL AUDIT)      ")
+	t.Logf("================================================================")
+	t.Logf(" Baseline Payload (include_embeddings=true):  %.2f KB avg       ", avgBaselineKB)
+	t.Logf(" Stripped Payload (include_embeddings=false): %.2f KB avg       ", avgStrippedKB)
+	t.Logf(" Min Stripped Payload:                        %d bytes          ", minStrippedPayload)
+	t.Logf(" Max Stripped Payload:                        %d bytes (< 2 KB) ", maxStrippedPayload)
+	t.Logf(" Total Payload Reduction:                     %.1f%%            ", (1.0-(avgStrippedKB/avgBaselineKB))*100.0)
+	t.Logf("================================================================")
+
+	// Verification 1: Baseline payload is ~19-21 KB
+	if avgBaselineKB < 18.0 || avgBaselineKB > 22.0 {
+		t.Fatalf("expected baseline payload to be ~19-21 KB, got %.2f KB", avgBaselineKB)
+	}
+
+	// Verification 2: Stripped payload is strictly < 2 KB
+	if avgStrippedKB >= 2.0 {
+		t.Fatalf("expected stripped payload to be < 2 KB, got %.2f KB", avgStrippedKB)
 	}
 }
