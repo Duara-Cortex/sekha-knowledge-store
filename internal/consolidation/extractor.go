@@ -44,6 +44,7 @@ type ExtractionResult struct {
 	Edges    []model.ExtractedRelation
 	Outcome  string
 	Salience float64
+	Anchors  []string
 }
 
 // Extract processes a single episodic deliberation trace into graph entities and causal relationships.
@@ -51,6 +52,7 @@ func (e *Extractor) Extract(trace model.EpisodicTrace) ExtractionResult {
 	res := ExtractionResult{
 		Entities: make([]model.ExtractedEntity, 0),
 		Edges:    make([]model.ExtractedRelation, 0),
+		Anchors:  trace.Anchors,
 	}
 
 	// 1. Determine resolved outcome and salience multiplier

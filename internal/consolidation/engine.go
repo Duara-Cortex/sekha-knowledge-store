@@ -74,6 +74,7 @@ func (e *Engine) IngestTrace(ctx context.Context, req model.ConsolidateRequest) 
 		SensoryContext:   req.SensoryContext,
 		Trajectory:       req.Trajectory,
 		CandidateActions: req.CandidateActions,
+		Anchors:          req.Anchors,
 		CreatedAt:        time.Now().UTC(),
 	}
 
@@ -113,7 +114,9 @@ func (e *Engine) IngestTrace(ctx context.Context, req model.ConsolidateRequest) 
 		resp.EdgesReinforced = fusionRes.EdgesReinforced
 		resp.CreatedNodes = fusionRes.CreatedNodes
 
-		e.notifyNodeListeners(fusionRes.CreatedNodes)
+		allModified := append([]model.Node{}, fusionRes.CreatedNodes...)
+		allModified = append(allModified, fusionRes.UpdatedNodes...)
+		e.notifyNodeListeners(allModified)
 	}
 
 	return resp, nil
@@ -165,6 +168,9 @@ func (e *Engine) RunConsolidationCycle(ctx context.Context, refTime time.Time) (
 		totalEdgesReinforced += fusionRes.EdgesReinforced
 		if len(fusionRes.CreatedNodes) > 0 {
 			cycleCreatedNodes = append(cycleCreatedNodes, fusionRes.CreatedNodes...)
+		}
+		if len(fusionRes.UpdatedNodes) > 0 {
+			cycleCreatedNodes = append(cycleCreatedNodes, fusionRes.UpdatedNodes...)
 		}
 
 		if err := e.store.MarkTraceConsolidated(ctx, trace.ID, refTime); err != nil {

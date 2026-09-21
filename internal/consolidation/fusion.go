@@ -31,6 +31,7 @@ type FusionResult struct {
 	EdgesReinforced  int
 	EntityIDMappings map[string]string // trace entity ID -> canonical persistent node ID
 	CreatedNodes     []model.Node
+	UpdatedNodes     []model.Node
 }
 
 // Fuse assimilates extracted entities and relationships into the persistent knowledge store.
@@ -61,6 +62,13 @@ func (f *FusionEngine) Fuse(ctx context.Context, extraction ExtractionResult, re
 			if err := f.store.BoostNodeStability(ctx, existing.ID, deltaStability, refTime); err != nil {
 				return nil, fmt.Errorf("failed boosting stability for node %s: %w", existing.ID, err)
 			}
+			if len(extraction.Anchors) > 0 {
+				if err := f.store.AttachAnchors(ctx, existing.ID, extraction.Anchors); err != nil {
+					return nil, fmt.Errorf("failed attaching anchors to node %s: %w", existing.ID, err)
+				}
+				existing.Anchors = append(existing.Anchors, extraction.Anchors...)
+			}
+			result.UpdatedNodes = append(result.UpdatedNodes, *existing)
 			result.EntitiesFused++
 		} else {
 			// Novel entity: allocate persistent knowledge vertex
@@ -78,6 +86,7 @@ func (f *FusionEngine) Fuse(ctx context.Context, extraction ExtractionResult, re
 				Label:            extracted.Label,
 				Summary:          extracted.Summary,
 				Embedding:        extracted.Embedding,
+				Anchors:          extraction.Anchors,
 				CreatedAt:        refTime,
 				LastAccessedAt:   refTime,
 				LastReinforcedAt: refTime,

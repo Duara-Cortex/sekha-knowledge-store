@@ -235,5 +235,110 @@ func main() {
 		fmt.Printf(" RESULT: FAIL - Recall latency exceeded %.1fms threshold\n", targetLatency)
 		os.Exit(1)
 	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// 6. Multi-Project Anchor Recall Benchmark
+	fmt.Println("\n[Step 5] Multi-Project Anchor Benchmark (Eliminating Generic Token Dilution)...")
+	projects := []struct {
+		name   string
+		anchor string
+	}{
+		{name: "Kestrel", anchor: "#project:kestrel"},
+		{name: "Falcon", anchor: "#project:falcon"},
+		{name: "Merlin", anchor: "#project:merlin"},
+	}
+
+	genericTopics := []string{
+		"network port timeout settings",
+		"buffer retry queue overflow threshold",
+		"keepalive heartbeat socket drop",
+		"rpc connection deadline limit",
+		"circuit breaker error rate tripping",
+	}
+
+	var anchorNodes []model.Node
+	for pIdx, proj := range projects {
+		for tIdx, topic := range genericTopics {
+			anchorNodes = append(anchorNodes, model.Node{
+				ID:             fmt.Sprintf("node-mp-%d-%d", pIdx+1, tIdx+1),
+				EntityType:     "concept",
+				Label:          fmt.Sprintf("%s %s", proj.name, topic),
+				Summary:        fmt.Sprintf("Project %s operational configuration for %s", proj.name, topic),
+				Anchors:        []string{proj.anchor},
+				CreatedAt:      now.Add(-time.Duration(pIdx*24) * time.Hour),
+				LastAccessedAt: now.Add(-time.Duration(pIdx*12) * time.Hour),
+				AccessCount:    int64(10 + (3-pIdx)*20),
+				StabilityScore: 1.0,
+			})
+		}
+	}
+
+	if _, err := sqliteStore.InsertNodes(ctx, anchorNodes); err != nil {
+		fmt.Printf("[FATAL] Error inserting anchor benchmark nodes: %v\n", err)
+		os.Exit(1)
+	}
+	engine.RegisterNodes(anchorNodes)
+
+	anchorQueries := 100
+	anchorHits := 0
+	anchorLatencies := make([]float64, 0, anchorQueries)
+	var anchorTotalLatency float64
+
+	for i := 0; i < anchorQueries; i++ {
+		targetProj := projects[rng.Intn(len(projects))]
+		topic := genericTopics[rng.Intn(len(genericTopics))]
+
+		req := model.RecallRequest{
+			Query:      topic,
+			Anchors:    []string{targetProj.anchor},
+			AnchorMode: "boost",
+			TopK:       5,
+		}
+
+		resp, err := engine.Recall(ctx, req)
+		if err != nil {
+			fmt.Printf("[FATAL] Anchor query %d failed: %v\n", i, err)
+			os.Exit(1)
+		}
+
+		if len(resp.Nodes) == 0 {
+			fmt.Printf("[FATAL] Anchor query %d returned 0 nodes\n", i)
+			os.Exit(1)
+		}
+
+		anchorLatencies = append(anchorLatencies, resp.QueryLatencyMS)
+		anchorTotalLatency += resp.QueryLatencyMS
+
+		for _, a := range resp.Nodes[0].Anchors {
+			if a == targetProj.anchor {
+				anchorHits++
+				break
+			}
+		}
+	}
+
+	sort.Float64s(anchorLatencies)
+	anchorMean := anchorTotalLatency / float64(len(anchorLatencies))
+	anchorP95 := anchorLatencies[len(anchorLatencies)*95/100]
+	hitRate := float64(anchorHits) / float64(anchorQueries) * 100.0
+
+	fmt.Println("----------------------------------------------------------------")
+	fmt.Println("             MULTI-PROJECT ANCHOR BENCHMARK RESULTS             ")
+	fmt.Println("----------------------------------------------------------------")
+	fmt.Printf(" Multi-Project Nodes:   %d (3 projects, overlapping generic tokens)\n", len(anchorNodes))
+	fmt.Printf(" Benchmark Queries:     %d iterations\n", anchorQueries)
+	fmt.Printf(" Target Rank 1 Hit:     %.1f%% (Target: >= 90.0%%)\n", hitRate)
+	fmt.Printf(" Mean Query Latency:    %.3f ms (Target: < 20.0 ms)\n", anchorMean)
+	fmt.Printf(" 95th Percentile (p95): %.3f ms (Target: < 20.0 ms)\n", anchorP95)
+	fmt.Println("----------------------------------------------------------------")
+
+	if hitRate >= 90.0 && anchorP95 < targetLatency {
+		fmt.Println(" RESULT: PASS - Multi-project anchor tags eliminate ranking dilution")
+		fmt.Println(" with >= 90% Rank 1 precision and sub-20ms edge query latency!")
+	} else {
+		fmt.Printf(" RESULT: FAIL - Anchor benchmark did not satisfy requirements (Hit Rate: %.1f%%, p95: %.3fms)\n", hitRate, anchorP95)
+		os.Exit(1)
+	}
 	fmt.Println("================================================================")
 }

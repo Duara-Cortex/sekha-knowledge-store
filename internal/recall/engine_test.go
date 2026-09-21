@@ -16,18 +16,73 @@ type mockStore struct {
 	nodes   map[string]model.Node
 	edges   []model.Edge
 	headers []store.NodeHeader
+	anchors map[string][]string
 }
 
 func newMockStore() *mockStore {
 	return &mockStore{
-		nodes: make(map[string]model.Node),
+		nodes:   make(map[string]model.Node),
+		anchors: make(map[string][]string),
 	}
 }
 
 func (m *mockStore) Close() error { return nil }
 
+func (m *mockStore) AttachAnchors(ctx context.Context, nodeID string, anchors []string) error {
+	seen := make(map[string]struct{})
+	for _, existing := range m.anchors[nodeID] {
+		seen[existing] = struct{}{}
+	}
+	for _, a := range anchors {
+		clean := model.NormalizeAnchor(a)
+		if clean != "" {
+			if _, exists := seen[clean]; !exists {
+				seen[clean] = struct{}{}
+				m.anchors[nodeID] = append(m.anchors[nodeID], clean)
+			}
+		}
+	}
+	if n, ok := m.nodes[nodeID]; ok {
+		n.Anchors = m.anchors[nodeID]
+		m.nodes[nodeID] = n
+	}
+	return nil
+}
+
+func (m *mockStore) GetAnchorsForNode(ctx context.Context, nodeID string) ([]string, error) {
+	return m.anchors[nodeID], nil
+}
+
+func (m *mockStore) GetNodeIDsForAnchors(ctx context.Context, anchors []string) ([]string, error) {
+	var res []string
+	seen := make(map[string]struct{})
+	target := make(map[string]struct{})
+	for _, a := range anchors {
+		clean := model.NormalizeAnchor(a)
+		if clean != "" {
+			target[clean] = struct{}{}
+		}
+	}
+	for nodeID, tags := range m.anchors {
+		for _, t := range tags {
+			if _, ok := target[t]; ok {
+				if _, added := seen[nodeID]; !added {
+					seen[nodeID] = struct{}{}
+					res = append(res, nodeID)
+				}
+				break
+			}
+		}
+	}
+	return res, nil
+}
+
 func (m *mockStore) InsertNodes(ctx context.Context, nodes []model.Node) (int, error) {
 	for _, n := range nodes {
+		if len(n.Anchors) > 0 {
+			_ = m.AttachAnchors(ctx, n.ID, n.Anchors)
+			n.Anchors = m.anchors[n.ID]
+		}
 		m.nodes[n.ID] = n
 		var mag float32
 		if len(n.Embedding) > 0 {
@@ -47,6 +102,7 @@ func (m *mockStore) InsertNodes(ctx context.Context, nodes []model.Node) (int, e
 			LastAccessedAt: n.LastAccessedAt,
 			AccessCount:    n.AccessCount,
 			StabilityScore: n.StabilityScore,
+			Anchors:        m.anchors[n.ID],
 		})
 	}
 	return len(nodes), nil
@@ -62,6 +118,7 @@ func (m *mockStore) GetNode(ctx context.Context, id string) (*model.Node, error)
 	if !exists {
 		return nil, nil
 	}
+	n.Anchors = m.anchors[id]
 	return &n, nil
 }
 
@@ -69,6 +126,7 @@ func (m *mockStore) GetNodes(ctx context.Context, ids []string) (map[string]mode
 	res := make(map[string]model.Node)
 	for _, id := range ids {
 		if n, ok := m.nodes[id]; ok {
+			n.Anchors = m.anchors[id]
 			res[id] = n
 		}
 	}
@@ -520,3 +578,228 @@ func TestRecallEngine_OvercomesRecencyTrap(t *testing.T) {
 		resp.Nodes[1].Score, resp.Nodes[1].SimScore, resp.Nodes[1].RecencyScore)
 }
 
+func TestRecallEngine_AnchorModeBoost(t *testing.T) {
+	ctx := context.Background()
+	ms := newMockStore()
+
+	now := time.Now().UTC()
+
+	// Distractor Node: Project Falcon has higher generic similarity, high access count, and high recency
+	distractor := model.Node{
+		ID:             "falcon-port-timeout",
+		EntityType:     "decision",
+		Label:          "Falcon port timeout buffer configuration",
+		Summary:        "Port timeout and buffer retry limits for falcon cluster node",
+		Anchors:        []string{"#project:falcon"},
+		CreatedAt:      now.Add(-10 * time.Minute),
+		LastAccessedAt: now.Add(-10 * time.Minute),
+		AccessCount:    80,
+		StabilityScore: 1.0,
+	}
+
+	// Target Node: Project Kestrel has lower generic similarity, low access count, and is older
+	target := model.Node{
+		ID:             "kestrel-port-timeout",
+		EntityType:     "decision",
+		Label:          "Port timeout parameters",
+		Summary:        "Timeout settings",
+		Anchors:        []string{"#project:kestrel"},
+		CreatedAt:      now.Add(-72 * time.Hour),
+		LastAccessedAt: now.Add(-72 * time.Hour),
+		AccessCount:    1,
+		StabilityScore: 1.0,
+	}
+
+	_, _ = ms.InsertNodes(ctx, []model.Node{distractor, target})
+
+	engine, err := NewEngine(ctx, ms, DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	// 1. Without anchors: distractor dominates due to higher lexical similarity, recency, and frequency
+	baselineResp, err := engine.Recall(ctx, model.RecallRequest{
+		Query: "Falcon port timeout buffer configuration",
+		TopK:  2,
+	})
+	if err != nil {
+		t.Fatalf("baseline recall failed: %v", err)
+	}
+	if len(baselineResp.Nodes) < 2 || baselineResp.Nodes[0].ID != "falcon-port-timeout" {
+		t.Fatalf("expected falcon-port-timeout at rank 1 in baseline, got %s", baselineResp.Nodes[0].ID)
+	}
+
+	// 2. With #project:kestrel anchor and anchor_mode: "boost"
+	boostResp, err := engine.Recall(ctx, model.RecallRequest{
+		Query:      "Falcon port timeout buffer configuration",
+		Anchors:    []string{"#project:kestrel"},
+		AnchorMode: "boost",
+		TopK:       2,
+	})
+	if err != nil {
+		t.Fatalf("boost recall failed: %v", err)
+	}
+
+	if len(boostResp.Nodes) != 2 {
+		t.Fatalf("expected 2 returned nodes in boost mode, got %d", len(boostResp.Nodes))
+	}
+
+	// Kestrel MUST be elevated to Rank 1 over the higher generic similarity Falcon node
+	if boostResp.Nodes[0].ID != "kestrel-port-timeout" {
+		t.Fatalf("expected kestrel-port-timeout elevated to rank 1, but got %s (score: %f vs %f)",
+			boostResp.Nodes[0].ID, boostResp.Nodes[0].Score, boostResp.Nodes[1].Score)
+	}
+	if boostResp.Nodes[0].AnchorScore != 1.0 {
+		t.Fatalf("expected anchor_score 1.0 on rank 1 node, got %f", boostResp.Nodes[0].AnchorScore)
+	}
+
+	// Non-anchored associative results are NOT excluded: Falcon should still be at Rank 2
+	if boostResp.Nodes[1].ID != "falcon-port-timeout" {
+		t.Fatalf("expected falcon-port-timeout at rank 2, got %s", boostResp.Nodes[1].ID)
+	}
+	if boostResp.Nodes[1].AnchorScore != 0.0 {
+		t.Fatalf("expected anchor_score 0.0 on unanchored rank 2 node, got %f", boostResp.Nodes[1].AnchorScore)
+	}
+
+	t.Logf("Rank 1 (Anchored): %s (Score: %f, Sim: %f, AnchorScore: %f)",
+		boostResp.Nodes[0].ID, boostResp.Nodes[0].Score, boostResp.Nodes[0].SimScore, boostResp.Nodes[0].AnchorScore)
+	t.Logf("Rank 2 (Unanchored): %s (Score: %f, Sim: %f, AnchorScore: %f)",
+		boostResp.Nodes[1].ID, boostResp.Nodes[1].Score, boostResp.Nodes[1].SimScore, boostResp.Nodes[1].AnchorScore)
+}
+
+func TestRecallEngine_AnchorModeFilter(t *testing.T) {
+	ctx := context.Background()
+	ms := newMockStore()
+
+	now := time.Now().UTC()
+
+	nodeKestrel := model.Node{
+		ID:             "kestrel-node",
+		EntityType:     "decision",
+		Label:          "Kestrel Service Port",
+		Summary:        "Port 8084 binding",
+		Anchors:        []string{"#project:kestrel"},
+		CreatedAt:      now,
+		LastAccessedAt: now,
+		StabilityScore: 1.0,
+	}
+
+	nodeFalcon := model.Node{
+		ID:             "falcon-node",
+		EntityType:     "decision",
+		Label:          "Falcon Service Port",
+		Summary:        "Port 8084 binding",
+		Anchors:        []string{"#project:falcon"},
+		CreatedAt:      now,
+		LastAccessedAt: now,
+		StabilityScore: 1.0,
+	}
+
+	nodeUnanchored := model.Node{
+		ID:             "unanchored-node",
+		EntityType:     "decision",
+		Label:          "Generic Service Port",
+		Summary:        "Port 8084 binding",
+		CreatedAt:      now,
+		LastAccessedAt: now,
+		StabilityScore: 1.0,
+	}
+
+	_, _ = ms.InsertNodes(ctx, []model.Node{nodeKestrel, nodeFalcon, nodeUnanchored})
+
+	engine, err := NewEngine(ctx, ms, DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	// Query with anchor_mode: "filter" targeting #project:kestrel
+	filterResp, err := engine.Recall(ctx, model.RecallRequest{
+		Query:      "service port",
+		Anchors:    []string{"#project:kestrel"},
+		AnchorMode: "filter",
+		TopK:       5,
+	})
+	if err != nil {
+		t.Fatalf("filter recall failed: %v", err)
+	}
+
+	// Strictly only matching nodes must be returned
+	if len(filterResp.Nodes) != 1 {
+		t.Fatalf("expected exactly 1 node returned under filter mode, got %d", len(filterResp.Nodes))
+	}
+	if filterResp.Nodes[0].ID != "kestrel-node" {
+		t.Fatalf("expected kestrel-node, got %s", filterResp.Nodes[0].ID)
+	}
+
+	// Query with non-matching anchor: must return 0 results
+	nonMatchingResp, err := engine.Recall(ctx, model.RecallRequest{
+		Query:      "service port",
+		Anchors:    []string{"#project:nonexistent"},
+		AnchorMode: "filter",
+		TopK:       5,
+	})
+	if err != nil {
+		t.Fatalf("filter recall failed: %v", err)
+	}
+	if len(nonMatchingResp.Nodes) != 0 {
+		t.Fatalf("expected 0 results for non-matching filter, got %d", len(nonMatchingResp.Nodes))
+	}
+}
+
+func TestRecallEngine_AnchorsOmittedRegression(t *testing.T) {
+	ctx := context.Background()
+	ms := newMockStore()
+
+	now := time.Now().UTC()
+
+	node1 := model.Node{
+		ID:             "dominant-node",
+		EntityType:     "concept",
+		Label:          "Database connection timeout",
+		Summary:        "Connection timeout after 30 seconds",
+		Anchors:        []string{"#project:alpha"},
+		CreatedAt:      now,
+		LastAccessedAt: now,
+		AccessCount:    50,
+		StabilityScore: 1.0,
+	}
+
+	node2 := model.Node{
+		ID:             "secondary-node",
+		EntityType:     "concept",
+		Label:          "Socket timeout",
+		Summary:        "Low level socket timeout",
+		Anchors:        []string{"#project:beta"},
+		CreatedAt:      now.Add(-48 * time.Hour),
+		LastAccessedAt: now.Add(-48 * time.Hour),
+		AccessCount:    2,
+		StabilityScore: 1.0,
+	}
+
+	_, _ = ms.InsertNodes(ctx, []model.Node{node1, node2})
+
+	engine, err := NewEngine(ctx, ms, DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	// Query with empty anchors: queries must execute globally across the entire graph without anchor bias
+	resp, err := engine.Recall(ctx, model.RecallRequest{
+		Query: "database connection timeout",
+		TopK:  2,
+	})
+	if err != nil {
+		t.Fatalf("recall failed: %v", err)
+	}
+
+	if len(resp.Nodes) != 2 {
+		t.Fatalf("expected 2 nodes returned, got %d", len(resp.Nodes))
+	}
+	if resp.Nodes[0].ID != "dominant-node" {
+		t.Fatalf("expected dominant-node at rank 1, got %s", resp.Nodes[0].ID)
+	}
+	if resp.Nodes[0].AnchorScore != 0.0 || resp.Nodes[1].AnchorScore != 0.0 {
+		t.Fatalf("expected 0.0 anchor scores when anchors omitted, got %f and %f",
+			resp.Nodes[0].AnchorScore, resp.Nodes[1].AnchorScore)
+	}
+}

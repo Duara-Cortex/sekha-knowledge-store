@@ -18,18 +18,73 @@ type apiMockStore struct {
 	nodes   map[string]model.Node
 	edges   []model.Edge
 	headers []store.NodeHeader
+	anchors map[string][]string
 }
 
 func newAPIMockStore() *apiMockStore {
 	return &apiMockStore{
-		nodes: make(map[string]model.Node),
+		nodes:   make(map[string]model.Node),
+		anchors: make(map[string][]string),
 	}
 }
 
 func (m *apiMockStore) Close() error { return nil }
 
+func (m *apiMockStore) AttachAnchors(ctx context.Context, nodeID string, anchors []string) error {
+	seen := make(map[string]struct{})
+	for _, existing := range m.anchors[nodeID] {
+		seen[existing] = struct{}{}
+	}
+	for _, a := range anchors {
+		clean := model.NormalizeAnchor(a)
+		if clean != "" {
+			if _, exists := seen[clean]; !exists {
+				seen[clean] = struct{}{}
+				m.anchors[nodeID] = append(m.anchors[nodeID], clean)
+			}
+		}
+	}
+	if n, ok := m.nodes[nodeID]; ok {
+		n.Anchors = m.anchors[nodeID]
+		m.nodes[nodeID] = n
+	}
+	return nil
+}
+
+func (m *apiMockStore) GetAnchorsForNode(ctx context.Context, nodeID string) ([]string, error) {
+	return m.anchors[nodeID], nil
+}
+
+func (m *apiMockStore) GetNodeIDsForAnchors(ctx context.Context, anchors []string) ([]string, error) {
+	var res []string
+	seen := make(map[string]struct{})
+	target := make(map[string]struct{})
+	for _, a := range anchors {
+		clean := model.NormalizeAnchor(a)
+		if clean != "" {
+			target[clean] = struct{}{}
+		}
+	}
+	for nodeID, tags := range m.anchors {
+		for _, t := range tags {
+			if _, ok := target[t]; ok {
+				if _, added := seen[nodeID]; !added {
+					seen[nodeID] = struct{}{}
+					res = append(res, nodeID)
+				}
+				break
+			}
+		}
+	}
+	return res, nil
+}
+
 func (m *apiMockStore) InsertNodes(ctx context.Context, nodes []model.Node) (int, error) {
 	for _, n := range nodes {
+		if len(n.Anchors) > 0 {
+			_ = m.AttachAnchors(ctx, n.ID, n.Anchors)
+			n.Anchors = m.anchors[n.ID]
+		}
 		m.nodes[n.ID] = n
 		m.headers = append(m.headers, store.NodeHeader{
 			ID:             n.ID,
@@ -40,6 +95,7 @@ func (m *apiMockStore) InsertNodes(ctx context.Context, nodes []model.Node) (int
 			LastAccessedAt: n.LastAccessedAt,
 			AccessCount:    n.AccessCount,
 			StabilityScore: n.StabilityScore,
+			Anchors:        m.anchors[n.ID],
 		})
 	}
 	return len(nodes), nil
@@ -55,6 +111,7 @@ func (m *apiMockStore) GetNode(ctx context.Context, id string) (*model.Node, err
 	if !exists {
 		return nil, nil
 	}
+	n.Anchors = m.anchors[id]
 	return &n, nil
 }
 
@@ -62,6 +119,7 @@ func (m *apiMockStore) GetNodes(ctx context.Context, ids []string) (map[string]m
 	res := make(map[string]model.Node)
 	for _, id := range ids {
 		if n, ok := m.nodes[id]; ok {
+			n.Anchors = m.anchors[id]
 			res[id] = n
 		}
 	}
@@ -384,3 +442,160 @@ func TestAPIServer_ConsolidationRecallEndToEnd(t *testing.T) {
 		recResp2.Nodes[0].ID, recResp2.Nodes[0].SimScore, recResp2.Nodes[0].Score)
 }
 
+func TestAPIServer_AnchorBoostAndFilter(t *testing.T) {
+	ms := newAPIMockStore()
+	ctx := context.Background()
+
+	engine, err := recall.NewEngine(ctx, ms, recall.DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+	server := NewServer(ms, engine, 8084)
+
+	now := time.Now().UTC()
+
+	// 1. Insert two project nodes via /api/v1/memory/insert
+	insertReq := model.InsertRequest{
+		Nodes: []model.Node{
+			{
+				ID:             "kestrel-config",
+				EntityType:     "decision",
+				Label:          "Service Port Config",
+				Summary:        "Configured port 8084 for kestrel",
+				Anchors:        []string{"#project:kestrel"},
+				CreatedAt:      now.Add(-48 * time.Hour),
+				LastAccessedAt: now.Add(-48 * time.Hour),
+				AccessCount:    1,
+				StabilityScore: 1.0,
+			},
+			{
+				ID:             "falcon-config",
+				EntityType:     "decision",
+				Label:          "Service Port Config",
+				Summary:        "Configured port 8084 for falcon",
+				Anchors:        []string{"#project:falcon"},
+				CreatedAt:      now.Add(-1 * time.Minute),
+				LastAccessedAt: now.Add(-1 * time.Minute),
+				AccessCount:    50,
+				StabilityScore: 1.0,
+			},
+		},
+	}
+
+	body, _ := json.Marshal(insertReq)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/memory/insert", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("insert failed: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 2. Test Recall with anchor_mode: "boost"
+	recallBoostPayload := model.RecallRequest{
+		Query:      "Service Port Config",
+		Anchors:    []string{"#project:kestrel"},
+		AnchorMode: "boost",
+		TopK:       2,
+	}
+	body, _ = json.Marshal(recallBoostPayload)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/memory/recall", bytes.NewReader(body))
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("recall boost failed: %d %s", rec.Code, rec.Body.String())
+	}
+
+	var boostResp model.RecallResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &boostResp)
+	if len(boostResp.Nodes) != 2 {
+		t.Fatalf("expected 2 nodes in boost response, got %d", len(boostResp.Nodes))
+	}
+	if boostResp.Nodes[0].ID != "kestrel-config" {
+		t.Fatalf("expected kestrel-config at rank 1 due to anchor boost, got %s", boostResp.Nodes[0].ID)
+	}
+	if boostResp.Nodes[0].AnchorScore != 1.0 {
+		t.Fatalf("expected anchor_score 1.0 on rank 1 node, got %f", boostResp.Nodes[0].AnchorScore)
+	}
+
+	// 3. Test Recall with anchor_mode: "filter"
+	recallFilterPayload := model.RecallRequest{
+		Query:      "Service Port Config",
+		Anchors:    []string{"#project:kestrel"},
+		AnchorMode: "filter",
+		TopK:       2,
+	}
+	body, _ = json.Marshal(recallFilterPayload)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/memory/recall", bytes.NewReader(body))
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("recall filter failed: %d %s", rec.Code, rec.Body.String())
+	}
+
+	var filterResp model.RecallResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &filterResp)
+	if len(filterResp.Nodes) != 1 {
+		t.Fatalf("expected exactly 1 node in filter response, got %d", len(filterResp.Nodes))
+	}
+	if filterResp.Nodes[0].ID != "kestrel-config" {
+		t.Fatalf("expected kestrel-config, got %s", filterResp.Nodes[0].ID)
+	}
+
+	// 4. Test Consolidate with anchors
+	consolidatePayload := model.ConsolidateRequest{
+		TraceID:     "trace-circuit-breaker",
+		SessionID:   "sess-cb-01",
+		TaskGoal:    "Implement circuit breaker pattern for outbound RPC",
+		Outcome:     model.OutcomeSuccess,
+		Anchors:     []string{"#pattern:circuit-breaker"},
+		Synchronous: true,
+		Trajectory: []model.TrajectoryStep{
+			{
+				StepIndex: 1,
+				Thought:   "Wrap RPC calls in resilient circuit breaker",
+				Action:    "init_circuit_breaker",
+				Status:    "success",
+			},
+		},
+	}
+	body, _ = json.Marshal(consolidatePayload)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/memory/consolidate", bytes.NewReader(body))
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("consolidate failed: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 5. Test Recall for newly consolidated node with anchor filter
+	recallCbPayload := model.RecallRequest{
+		Query:      "circuit breaker resilient",
+		Anchors:    []string{"#pattern:circuit-breaker"},
+		AnchorMode: "filter",
+		TopK:       5,
+	}
+	body, _ = json.Marshal(recallCbPayload)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/memory/recall", bytes.NewReader(body))
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("recall cb failed: %d %s", rec.Code, rec.Body.String())
+	}
+
+	var cbResp model.RecallResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &cbResp)
+	if len(cbResp.Nodes) == 0 {
+		t.Fatalf("expected recalled nodes for circuit breaker anchor, got 0")
+	}
+	for _, n := range cbResp.Nodes {
+		var found bool
+		for _, a := range n.Anchors {
+			if a == "#pattern:circuit-breaker" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected node %s to have #pattern:circuit-breaker, got %v", n.ID, n.Anchors)
+		}
+	}
+}

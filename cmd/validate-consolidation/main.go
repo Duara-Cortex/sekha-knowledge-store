@@ -87,7 +87,7 @@ func main() {
 
 	// 80% transient noise, 20% recurrent hub events
 	for i := 0; i < *eventCount; i++ {
-		isHub := (i % 5 == 0) // 20% recurrent hub
+		isHub := (i%5 == 0) // 20% recurrent hub
 		var eventTime time.Time
 		if isHub {
 			// Recurrent hub entities occur across the full operational period (up to Day 14)

@@ -48,6 +48,7 @@ type EpisodicTrace struct {
 	SensoryContext   []SensoryItem     `json:"sensory_context,omitempty"`
 	Trajectory       []TrajectoryStep  `json:"trajectory,omitempty"`
 	CandidateActions []CandidateAction `json:"candidate_actions,omitempty"`
+	Anchors          []string          `json:"anchors,omitempty"`
 	Consolidated     bool              `json:"consolidated"`
 	CreatedAt        time.Time         `json:"created_at"`
 	ConsolidatedAt   *time.Time        `json:"consolidated_at,omitempty"`
@@ -60,10 +61,11 @@ type ConsolidateRequest struct {
 	TaskGoal         string            `json:"task_goal,omitempty"`
 	ActiveGoal       string            `json:"active_goal,omitempty"` // Fallback for Node 2 working memory state
 	Outcome          string            `json:"outcome,omitempty"`
-	Status           string            `json:"status,omitempty"`      // Fallback for Node 2 status
+	Status           string            `json:"status,omitempty"` // Fallback for Node 2 status
 	SensoryContext   []SensoryItem     `json:"sensory_context,omitempty"`
 	Trajectory       []TrajectoryStep  `json:"trajectory,omitempty"`
 	CandidateActions []CandidateAction `json:"candidate_actions,omitempty"`
+	Anchors          []string          `json:"anchors,omitempty"`     // Optional anchor tags (e.g. ["#project:kestrel"])
 	Synchronous      bool              `json:"synchronous,omitempty"` // If true, triggers immediate inline fusion
 }
 
