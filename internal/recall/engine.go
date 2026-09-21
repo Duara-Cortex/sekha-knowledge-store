@@ -16,27 +16,29 @@ import (
 
 // EngineConfig configures hyperparameter defaults and decay constants.
 type EngineConfig struct {
-	DefaultAlpha       float64       // Semantic similarity weight (default: 0.6)
-	DefaultBeta        float64       // Usage frequency weight (default: 0.2)
-	DefaultGamma       float64       // Recency decay weight (default: 0.2)
-	DecayHalfLife      time.Duration // Time constant tau for recency decay (default: 24h)
-	FrequencyMaxCount  float64       // Access count normalisation baseline (default: 100.0)
-	NeighbourHopBoost  float64       // Attenuation factor for 1-hop expansion (default: 0.35)
-	MaxCandidatePool   int           // Max top vector seeds for graph expansion (default: 20)
-	VectorDims         int           // Dimensionality for dynamic query embeddings (default: 64)
+	DefaultAlpha        float64       // Semantic similarity weight (default: 0.6)
+	DefaultBeta         float64       // Usage frequency weight (default: 0.2)
+	DefaultGamma        float64       // Recency decay weight (default: 0.2)
+	DefaultAnchorWeight float64       // Weight for anchor score bonus (default: 1.0)
+	DecayHalfLife       time.Duration // Time constant tau for recency decay (default: 24h)
+	FrequencyMaxCount   float64       // Access count normalisation baseline (default: 100.0)
+	NeighbourHopBoost   float64       // Attenuation factor for 1-hop expansion (default: 0.35)
+	MaxCandidatePool    int           // Max top vector seeds for graph expansion (default: 20)
+	VectorDims          int           // Dimensionality for dynamic query embeddings (default: 64)
 }
 
 // DefaultConfig provides balanced cognitive recall defaults.
 func DefaultConfig() EngineConfig {
 	return EngineConfig{
-		DefaultAlpha:      0.6,
-		DefaultBeta:       0.2,
-		DefaultGamma:      0.2,
-		DecayHalfLife:     24 * time.Hour,
-		FrequencyMaxCount: 100.0,
-		NeighbourHopBoost: 0.35,
-		MaxCandidatePool:  20,
-		VectorDims:        64,
+		DefaultAlpha:        0.6,
+		DefaultBeta:         0.2,
+		DefaultGamma:        0.2,
+		DefaultAnchorWeight: 1.0,
+		DecayHalfLife:       24 * time.Hour,
+		FrequencyMaxCount:   100.0,
+		NeighbourHopBoost:   0.35,
+		MaxCandidatePool:    20,
+		VectorDims:          64,
 	}
 }
 
@@ -45,20 +47,45 @@ type cachedNode struct {
 	entityType     string
 	label          string
 	summary        string
+	lowerLabel     string
+	lowerSummary   string
+	labelSet       map[string]bool
+	summarySet     map[string]bool
 	embedding      []float32
 	magnitude      float32
 	lastAccessedAt time.Time
 	accessCount    int64
 	stabilityScore float64
+	anchors        map[string]struct{}
+}
+
+func buildTokenSets(label, summary string) (string, string, map[string]bool, map[string]bool) {
+	lowerLabel := strings.ToLower(label)
+	lowerSummary := strings.ToLower(summary)
+
+	labelTokens := embedding.ExtractTokens(lowerLabel)
+	summaryTokens := embedding.ExtractTokens(lowerSummary)
+
+	labelSet := make(map[string]bool, len(labelTokens))
+	for _, t := range labelTokens {
+		labelSet[t] = true
+	}
+
+	summarySet := make(map[string]bool, len(summaryTokens))
+	for _, t := range summaryTokens {
+		summarySet[t] = true
+	}
+
+	return lowerLabel, lowerSummary, labelSet, summarySet
 }
 
 // Engine implements the associative recall algorithm and in-memory vector index.
 type Engine struct {
-	store  store.Store
-	cfg    EngineConfig
-	mu     sync.RWMutex
-	nodes  map[string]*cachedNode
-	index  []*cachedNode
+	store store.Store
+	cfg   EngineConfig
+	mu    sync.RWMutex
+	nodes map[string]*cachedNode
+	index []*cachedNode
 }
 
 // NewEngine creates and hydrates the associative recall engine from the underlying store.
@@ -97,16 +124,29 @@ func (e *Engine) Hydrate(ctx context.Context) error {
 		if h.IsArchived {
 			continue
 		}
+		anchorSet := make(map[string]struct{}, len(h.Anchors))
+		for _, a := range h.Anchors {
+			clean := model.NormalizeAnchor(a)
+			if clean != "" {
+				anchorSet[clean] = struct{}{}
+			}
+		}
+		lowerLabel, lowerSummary, labelSet, summarySet := buildTokenSets(h.Label, h.Summary)
 		cn := &cachedNode{
 			id:             h.ID,
 			entityType:     h.EntityType,
 			label:          h.Label,
 			summary:        h.Summary,
+			lowerLabel:     lowerLabel,
+			lowerSummary:   lowerSummary,
+			labelSet:       labelSet,
+			summarySet:     summarySet,
 			embedding:      h.Embedding,
 			magnitude:      h.Magnitude,
 			lastAccessedAt: h.LastAccessedAt,
 			accessCount:    h.AccessCount,
 			stabilityScore: h.StabilityScore,
+			anchors:        anchorSet,
 		}
 		e.nodes[cn.id] = cn
 		e.index = append(e.index, cn)
@@ -135,6 +175,14 @@ func (e *Engine) RegisterNodes(nodes []model.Node) {
 			continue
 		}
 
+		anchorSet := make(map[string]struct{}, len(n.Anchors))
+		for _, a := range n.Anchors {
+			clean := model.NormalizeAnchor(a)
+			if clean != "" {
+				anchorSet[clean] = struct{}{}
+			}
+		}
+
 		var mag float32
 		if len(n.Embedding) > 0 {
 			var sum float64
@@ -144,27 +192,46 @@ func (e *Engine) RegisterNodes(nodes []model.Node) {
 			mag = float32(math.Sqrt(sum))
 		}
 
+		lowerLabel, lowerSummary, labelSet, summarySet := buildTokenSets(n.Label, n.Summary)
+
 		cn, exists := e.nodes[n.ID]
 		if exists {
 			cn.entityType = n.EntityType
 			cn.label = n.Label
 			cn.summary = n.Summary
+			cn.lowerLabel = lowerLabel
+			cn.lowerSummary = lowerSummary
+			cn.labelSet = labelSet
+			cn.summarySet = summarySet
 			if len(n.Embedding) > 0 {
 				cn.embedding = n.Embedding
 				cn.magnitude = mag
 			}
 			cn.stabilityScore = n.StabilityScore
+			if len(anchorSet) > 0 {
+				if cn.anchors == nil {
+					cn.anchors = make(map[string]struct{})
+				}
+				for a := range anchorSet {
+					cn.anchors[a] = struct{}{}
+				}
+			}
 		} else {
 			cn = &cachedNode{
 				id:             n.ID,
 				entityType:     n.EntityType,
 				label:          n.Label,
 				summary:        n.Summary,
+				lowerLabel:     lowerLabel,
+				lowerSummary:   lowerSummary,
+				labelSet:       labelSet,
+				summarySet:     summarySet,
 				embedding:      n.Embedding,
 				magnitude:      mag,
 				lastAccessedAt: n.LastAccessedAt,
 				accessCount:    n.AccessCount,
 				stabilityScore: n.StabilityScore,
+				anchors:        anchorSet,
 			}
 			e.nodes[n.ID] = cn
 			e.index = append(e.index, cn)
@@ -172,19 +239,43 @@ func (e *Engine) RegisterNodes(nodes []model.Node) {
 	}
 }
 
+// AttachAnchors dynamically updates anchor tags for an in-memory cached node.
+func (e *Engine) AttachAnchors(nodeID string, anchors []string) {
+	if nodeID == "" || len(anchors) == 0 {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	cn, exists := e.nodes[nodeID]
+	if !exists {
+		return
+	}
+	if cn.anchors == nil {
+		cn.anchors = make(map[string]struct{})
+	}
+	for _, a := range anchors {
+		clean := model.NormalizeAnchor(a)
+		if clean != "" {
+			cn.anchors[clean] = struct{}{}
+		}
+	}
+}
+
 // candidateScore tracks intermediate scores during recall ranking.
 type candidateScore struct {
-	id             string
-	totalScore     float64
-	baseScore      float64
-	simScore       float64
-	freqScore      float64
-	recencyScore   float64
-	hopDistance    int
+	id           string
+	totalScore   float64
+	baseScore    float64
+	simScore     float64
+	freqScore    float64
+	recencyScore float64
+	anchorScore  float64
+	hopDistance  int
 }
 
 // Recall executes the associative retrieval algorithm across semantic similarity,
-// usage frequency, recency decay, and 1-hop graph neighbour expansion.
+// usage frequency, recency decay, anchor tag linking, and 1-hop graph neighbour expansion.
 func (e *Engine) Recall(ctx context.Context, req model.RecallRequest) (*model.RecallResponse, error) {
 	start := time.Now()
 
@@ -224,13 +315,58 @@ func (e *Engine) Recall(ctx context.Context, req model.RecallRequest) (*model.Re
 	}
 
 	queryText := strings.TrimSpace(req.Query)
+
+	// Resolve target query anchors
+	var queryAnchors []string
+	seenQueryAnchors := make(map[string]struct{})
+	for _, a := range req.Anchors {
+		clean := model.NormalizeAnchor(a)
+		if clean != "" {
+			if _, exists := seenQueryAnchors[clean]; !exists {
+				seenQueryAnchors[clean] = struct{}{}
+				queryAnchors = append(queryAnchors, clean)
+			}
+		}
+	}
+
+	// Also extract inline hashtags from req.Query if present
+	if queryText != "" && strings.Contains(queryText, "#") {
+		fields := strings.Fields(queryText)
+		for _, f := range fields {
+			if strings.HasPrefix(f, "#") {
+				clean := model.NormalizeAnchor(f)
+				if clean != "" {
+					if _, exists := seenQueryAnchors[clean]; !exists {
+						seenQueryAnchors[clean] = struct{}{}
+						queryAnchors = append(queryAnchors, clean)
+					}
+				}
+			}
+		}
+	}
+
+	cleanQueryText := queryText
+	if len(queryAnchors) > 0 && strings.Contains(queryText, "#") {
+		var textParts []string
+		for _, word := range strings.Fields(queryText) {
+			if !strings.HasPrefix(word, "#") {
+				textParts = append(textParts, word)
+			}
+		}
+		if len(textParts) > 0 {
+			cleanQueryText = strings.Join(textParts, " ")
+		}
+	}
+
 	var queryTokens []string
-	if queryText != "" {
-		queryTokens = embedding.ExtractTokens(queryText)
+	var queryJoined string
+	if cleanQueryText != "" {
+		queryTokens = embedding.ExtractTokens(cleanQueryText)
+		queryJoined = strings.Join(queryTokens, " ")
 	}
 
 	// If embedding was not provided but query text was passed, dynamically generate semantic vector
-	if len(req.Embedding) == 0 && queryText != "" {
+	if len(req.Embedding) == 0 && cleanQueryText != "" {
 		dims := e.cfg.VectorDims
 		if dims <= 0 {
 			dims = 64
@@ -240,7 +376,7 @@ func (e *Engine) Recall(ctx context.Context, req model.RecallRequest) (*model.Re
 			dims = len(e.index[0].embedding)
 		}
 		e.mu.RUnlock()
-		req.Embedding = embedding.Generate(queryText, dims)
+		req.Embedding = embedding.Generate(cleanQueryText, dims)
 	}
 
 	// Compute query embedding magnitude
@@ -251,6 +387,19 @@ func (e *Engine) Recall(ctx context.Context, req model.RecallRequest) (*model.Re
 			sum += float64(v * v)
 		}
 		queryMag = float32(math.Sqrt(sum))
+	}
+
+	anchorMode := strings.ToLower(strings.TrimSpace(req.AnchorMode))
+	if anchorMode != "filter" {
+		anchorMode = "boost"
+	}
+
+	wAnc := req.AnchorWeight
+	if wAnc <= 0 {
+		wAnc = e.cfg.DefaultAnchorWeight
+		if wAnc <= 0 {
+			wAnc = 1.0
+		}
 	}
 
 	now := time.Now().UTC()
@@ -289,7 +438,7 @@ func (e *Engine) Recall(ctx context.Context, req model.RecallRequest) (*model.Re
 			// 1b. Lexical & Keyword Matching against node label and summary
 			var lexSim float64
 			if len(queryTokens) > 0 {
-				lexSim = embedding.ScoreLexical(queryTokens, cn.label, cn.summary)
+				lexSim = embedding.ScoreLexicalFast(queryTokens, queryJoined, cn.lowerLabel, cn.lowerSummary, cn.labelSet, cn.summarySet)
 			}
 
 			// Composite semantic signal: vector similarity + lexical overlap
@@ -328,13 +477,38 @@ func (e *Engine) Recall(ctx context.Context, req model.RecallRequest) (*model.Re
 			rScore *= (0.8 + 0.2*cn.stabilityScore)
 		}
 
+		// 4. Anchor Matching & Scoring
+		matchesAnchor := false
+		if len(queryAnchors) > 0 {
+			for _, qa := range queryAnchors {
+				if _, ok := cn.anchors[qa]; ok {
+					matchesAnchor = true
+					break
+				}
+			}
+		}
+
+		// Mode: "filter" - discard non-matching candidates before ranking
+		if len(queryAnchors) > 0 && anchorMode == "filter" && !matchesAnchor {
+			continue
+		}
+
+		anchorScore := 0.0
+		if matchesAnchor {
+			anchorScore = 1.0
+		}
+
+		// Score(v | q, anchors) = w_sim S_sim + w_rec S_rec + w_freq S_freq + w_anc S_anchor
+		totalScore := rScore + (wAnc * anchorScore)
+
 		cs := &candidateScore{
 			id:           cn.id,
-			totalScore:   rScore,
+			totalScore:   totalScore,
 			baseScore:    rScore,
 			simScore:     simScore,
 			freqScore:    freqScore,
 			recencyScore: recencyScore,
+			anchorScore:  anchorScore,
 			hopDistance:  0,
 		}
 		candidates[cn.id] = cs
@@ -385,7 +559,7 @@ func (e *Engine) Recall(ctx context.Context, req model.RecallRequest) (*model.Re
 				nCand, exists := candidates[neighbourID]
 				if exists {
 					boost := e.cfg.NeighbourHopBoost * math.Min(1.0, edge.Weight) * seedScore
-					newScore := nCand.baseScore + boost
+					newScore := nCand.baseScore + boost + (wAnc * nCand.anchorScore)
 					// A 1-hop neighbour cannot exceed the seed node that activated it
 					if nCand.baseScore < seedScore && newScore >= seedScore {
 						newScore = seedScore * 0.95
@@ -439,6 +613,7 @@ func (e *Engine) Recall(ctx context.Context, req model.RecallRequest) (*model.Re
 			SimScore:       math.Round(tc.simScore*10000) / 10000,
 			FrequencyScore: math.Round(tc.freqScore*10000) / 10000,
 			RecencyScore:   math.Round(tc.recencyScore*10000) / 10000,
+			AnchorScore:    math.Round(tc.anchorScore*10000) / 10000,
 			HopDistance:    tc.hopDistance,
 		})
 	}
@@ -546,4 +721,3 @@ func (e *Engine) StartBackgroundSync(ctx context.Context, interval time.Duration
 		}
 	}()
 }
-

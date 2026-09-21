@@ -11,8 +11,16 @@ import (
 	"time"
 
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/model"
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
+
+func init() {
+	sqlite.RegisterConnectionHook(func(conn sqlite.ExecQuerierContext, dsn string) error {
+		ctx := context.Background()
+		_, _ = conn.ExecContext(ctx, "PRAGMA busy_timeout=10000;", nil)
+		return nil
+	})
+}
 
 // SQLiteStore implements the Store interface using pure-Go SQLite (modernc.org/sqlite).
 type SQLiteStore struct {
@@ -26,7 +34,7 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 		dbPath = "sekha_knowledge.db"
 	}
 
-	dsn := fmt.Sprintf("%s?_busy_timeout=5000", dbPath)
+	dsn := fmt.Sprintf("%s?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)", dbPath)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite db: %w", err)
@@ -58,6 +66,7 @@ func (s *SQLiteStore) initPragmasAndSchema() error {
 		"PRAGMA journal_mode=WAL;",
 		"PRAGMA synchronous=NORMAL;",
 		"PRAGMA foreign_keys=ON;",
+		"PRAGMA busy_timeout=5000;",
 		"PRAGMA temp_store=MEMORY;",
 		"PRAGMA cache_size=-64000;", // 64MB page cache
 	}
@@ -114,6 +123,17 @@ func (s *SQLiteStore) initPragmasAndSchema() error {
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_traces_consolidated ON episodic_traces(consolidated, created_at);
+
+	CREATE TABLE IF NOT EXISTS node_anchors (
+		node_id TEXT NOT NULL,
+		anchor_tag TEXT NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (node_id, anchor_tag),
+		FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_node_anchors_tag ON node_anchors(anchor_tag);
+	CREATE INDEX IF NOT EXISTS idx_node_anchors_node ON node_anchors(node_id);
 	`
 
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
@@ -126,6 +146,15 @@ func (s *SQLiteStore) initPragmasAndSchema() error {
 		"ALTER TABLE nodes ADD COLUMN archived_at TIMESTAMP;",
 		"ALTER TABLE nodes ADD COLUMN last_reinforced_at TIMESTAMP;",
 		"ALTER TABLE edges ADD COLUMN last_reinforced_at TIMESTAMP;",
+		`CREATE TABLE IF NOT EXISTS node_anchors (
+			node_id TEXT NOT NULL,
+			anchor_tag TEXT NOT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (node_id, anchor_tag),
+			FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
+		);`,
+		"CREATE INDEX IF NOT EXISTS idx_node_anchors_tag ON node_anchors(anchor_tag);",
+		"CREATE INDEX IF NOT EXISTS idx_node_anchors_node ON node_anchors(node_id);",
 	}
 	for _, migration := range migrations {
 		_, _ = s.db.ExecContext(ctx, migration)
@@ -168,6 +197,16 @@ func (s *SQLiteStore) InsertNodes(ctx context.Context, nodes []model.Node) (int,
 		return 0, err
 	}
 	defer stmt.Close()
+
+	anchorStmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO node_anchors (node_id, anchor_tag, created_at)
+		VALUES (?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(node_id, anchor_tag) DO NOTHING
+	`)
+	if err != nil {
+		return 0, err
+	}
+	defer anchorStmt.Close()
 
 	now := time.Now().UTC()
 	inserted := 0
@@ -223,6 +262,17 @@ func (s *SQLiteStore) InsertNodes(ctx context.Context, nodes []model.Node) (int,
 		if err != nil {
 			return inserted, fmt.Errorf("failed inserting node %s: %w", n.ID, err)
 		}
+
+		for _, a := range n.Anchors {
+			clean := model.NormalizeAnchor(a)
+			if clean == "" {
+				continue
+			}
+			if _, err := anchorStmt.ExecContext(ctx, n.ID, clean); err != nil {
+				return inserted, fmt.Errorf("failed inserting node anchor %s->%s: %w", n.ID, clean, err)
+			}
+		}
+
 		inserted++
 	}
 
@@ -302,6 +352,156 @@ func (s *SQLiteStore) InsertEdges(ctx context.Context, edges []model.Edge) (int,
 	return inserted, nil
 }
 
+// AttachAnchors associates anchor tags to a node within a standalone transaction.
+func (s *SQLiteStore) AttachAnchors(ctx context.Context, nodeID string, anchors []string) error {
+	if nodeID == "" || len(anchors) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := s.AttachAnchorsTx(ctx, tx, nodeID, anchors); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+// AttachAnchorsTx associates anchor tags to a node within an existing transaction.
+func (s *SQLiteStore) AttachAnchorsTx(ctx context.Context, tx *sql.Tx, nodeID string, anchors []string) error {
+	if nodeID == "" || len(anchors) == 0 {
+		return nil
+	}
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO node_anchors (node_id, anchor_tag, created_at)
+		VALUES (?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(node_id, anchor_tag) DO NOTHING
+	`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	seen := make(map[string]struct{})
+	for _, a := range anchors {
+		clean := model.NormalizeAnchor(a)
+		if clean == "" {
+			continue
+		}
+		if _, exists := seen[clean]; exists {
+			continue
+		}
+		seen[clean] = struct{}{}
+
+		if _, err := stmt.ExecContext(ctx, nodeID, clean); err != nil {
+			return fmt.Errorf("failed inserting node anchor %s->%s: %w", nodeID, clean, err)
+		}
+	}
+
+	return nil
+}
+
+// GetAnchorsForNode retrieves all anchor tags attached to a specific node ID.
+func (s *SQLiteStore) GetAnchorsForNode(ctx context.Context, nodeID string) ([]string, error) {
+	if nodeID == "" {
+		return []string{}, nil
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT anchor_tag
+		FROM node_anchors
+		WHERE node_id = ?
+		ORDER BY anchor_tag ASC
+	`, nodeID)
+	if err != nil {
+		return nil, fmt.Errorf("failed querying anchors for node %s: %w", nodeID, err)
+	}
+	defer rows.Close()
+
+	anchors := make([]string, 0)
+	for rows.Next() {
+		var tag string
+		if err := rows.Scan(&tag); err != nil {
+			return nil, fmt.Errorf("failed scanning anchor tag: %w", err)
+		}
+		anchors = append(anchors, tag)
+	}
+	return anchors, nil
+}
+
+// GetNodeIDsForAnchors returns all distinct node IDs associated with any of the specified anchor tags.
+func (s *SQLiteStore) GetNodeIDsForAnchors(ctx context.Context, anchors []string) ([]string, error) {
+	if len(anchors) == 0 {
+		return []string{}, nil
+	}
+
+	cleanAnchors := make([]string, 0, len(anchors))
+	seenTags := make(map[string]struct{})
+	for _, a := range anchors {
+		clean := model.NormalizeAnchor(a)
+		if clean != "" {
+			if _, exists := seenTags[clean]; !exists {
+				seenTags[clean] = struct{}{}
+				cleanAnchors = append(cleanAnchors, clean)
+			}
+		}
+	}
+	if len(cleanAnchors) == 0 {
+		return []string{}, nil
+	}
+
+	var allNodeIDs []string
+	seenNodeIDs := make(map[string]struct{})
+	const batchSize = 500
+
+	for i := 0; i < len(cleanAnchors); i += batchSize {
+		end := i + batchSize
+		if end > len(cleanAnchors) {
+			end = len(cleanAnchors)
+		}
+		batch := cleanAnchors[i:end]
+
+		placeholders := strings.Repeat("?,", len(batch))
+		placeholders = placeholders[:len(placeholders)-1]
+
+		args := make([]any, len(batch))
+		for idx, tag := range batch {
+			args[idx] = tag
+		}
+
+		query := fmt.Sprintf(`
+			SELECT DISTINCT node_id
+			FROM node_anchors
+			WHERE anchor_tag IN (%s)
+		`, placeholders)
+
+		rows, err := s.db.QueryContext(ctx, query, args...)
+		if err != nil {
+			return nil, fmt.Errorf("failed querying node IDs for anchors: %w", err)
+		}
+
+		for rows.Next() {
+			var nodeID string
+			if err := rows.Scan(&nodeID); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("failed scanning node ID: %w", err)
+			}
+			if _, exists := seenNodeIDs[nodeID]; !exists {
+				seenNodeIDs[nodeID] = struct{}{}
+				allNodeIDs = append(allNodeIDs, nodeID)
+			}
+		}
+		rows.Close()
+	}
+
+	return allNodeIDs, nil
+}
+
 func scanNodeFromRow(row interface{ Scan(dest ...any) error }) (*model.Node, error) {
 	var n model.Node
 	var blob []byte
@@ -364,6 +564,11 @@ func (s *SQLiteStore) GetNode(ctx context.Context, id string) (*model.Node, erro
 		return nil, err
 	}
 
+	anchors, err := s.GetAnchorsForNode(ctx, id)
+	if err == nil && len(anchors) > 0 {
+		n.Anchors = anchors
+	}
+
 	return n, nil
 }
 
@@ -410,6 +615,26 @@ func (s *SQLiteStore) GetNodes(ctx context.Context, ids []string) (map[string]mo
 			res[n.ID] = *n
 		}
 		rows.Close()
+
+		// Populate anchors for this batch
+		anchorRows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+			SELECT node_id, anchor_tag
+			FROM node_anchors
+			WHERE node_id IN (%s)
+			ORDER BY anchor_tag ASC
+		`, placeholders), args...)
+		if err == nil {
+			for anchorRows.Next() {
+				var nodeID, tag string
+				if err := anchorRows.Scan(&nodeID, &tag); err == nil {
+					if n, ok := res[nodeID]; ok {
+						n.Anchors = append(n.Anchors, tag)
+						res[nodeID] = n
+					}
+				}
+			}
+			anchorRows.Close()
+		}
 	}
 
 	return res, nil
@@ -417,6 +642,22 @@ func (s *SQLiteStore) GetNodes(ctx context.Context, ids []string) (map[string]mo
 
 // GetAllNodeHeaders scans lightweight headers and embeddings for in-memory indexing of active nodes.
 func (s *SQLiteStore) GetAllNodeHeaders(ctx context.Context) ([]NodeHeader, error) {
+	anchorsMap := make(map[string][]string)
+	anchorRows, err := s.db.QueryContext(ctx, `
+		SELECT node_id, anchor_tag
+		FROM node_anchors
+		ORDER BY anchor_tag ASC
+	`)
+	if err == nil {
+		for anchorRows.Next() {
+			var nodeID, tag string
+			if err := anchorRows.Scan(&nodeID, &tag); err == nil {
+				anchorsMap[nodeID] = append(anchorsMap[nodeID], tag)
+			}
+		}
+		anchorRows.Close()
+	}
+
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, entity_type, label, summary, embedding, last_accessed_at, access_count, stability_score, is_archived
 		FROM nodes
@@ -460,6 +701,7 @@ func (s *SQLiteStore) GetAllNodeHeaders(ctx context.Context) ([]NodeHeader, erro
 			h.LastAccessedAt = t
 		}
 		h.IsArchived = isArchivedInt == 1
+		h.Anchors = anchorsMap[h.ID]
 		headers = append(headers, h)
 	}
 

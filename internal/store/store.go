@@ -19,6 +19,7 @@ type NodeHeader struct {
 	AccessCount    int64
 	StabilityScore float64
 	IsArchived     bool
+	Anchors        []string
 }
 
 // Store defines persistence operations for the relational knowledge graph.
@@ -29,6 +30,11 @@ type Store interface {
 	// Ingestion / Persistence
 	InsertNodes(ctx context.Context, nodes []model.Node) (int, error)
 	InsertEdges(ctx context.Context, edges []model.Edge) (int, error)
+
+	// Anchors
+	AttachAnchors(ctx context.Context, nodeID string, anchors []string) error
+	GetAnchorsForNode(ctx context.Context, nodeID string) ([]string, error)
+	GetNodeIDsForAnchors(ctx context.Context, anchors []string) ([]string, error)
 
 	// Retrieval
 	GetNode(ctx context.Context, id string) (*model.Node, error)

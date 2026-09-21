@@ -215,6 +215,16 @@ func ScoreLexical(queryTokens []string, label, summary string) float64 {
 		summarySet[t] = true
 	}
 
+	queryJoined := strings.Join(queryTokens, " ")
+	return ScoreLexicalFast(queryTokens, queryJoined, lowerLabel, lowerSummary, labelSet, summarySet)
+}
+
+// ScoreLexicalFast computes lexical similarity using pre-tokenized sets for high-throughput in-memory queries.
+func ScoreLexicalFast(queryTokens []string, queryJoined string, lowerLabel, lowerSummary string, labelSet, summarySet map[string]bool) float64 {
+	if len(queryTokens) == 0 {
+		return 0.0
+	}
+
 	matchedWeight := 0.0
 	totalWeight := float64(len(queryTokens)) * 2.0 // Label match weight baseline
 
@@ -236,11 +246,12 @@ func ScoreLexical(queryTokens []string, label, summary string) float64 {
 	}
 
 	// Full query string exact match bonus
-	queryJoined := strings.Join(queryTokens, " ")
-	if strings.Contains(lowerLabel, queryJoined) {
-		ratio = math.Max(ratio, 0.95)
-	} else if strings.Contains(lowerSummary, queryJoined) {
-		ratio = math.Max(ratio, 0.80)
+	if queryJoined != "" {
+		if strings.Contains(lowerLabel, queryJoined) {
+			ratio = math.Max(ratio, 0.95)
+		} else if strings.Contains(lowerSummary, queryJoined) {
+			ratio = math.Max(ratio, 0.80)
+		}
 	}
 
 	return math.Round(ratio*10000) / 10000
