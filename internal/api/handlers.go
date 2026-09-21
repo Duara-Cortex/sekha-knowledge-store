@@ -1,8 +1,11 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/consolidation"
@@ -78,12 +81,45 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // handleRecall processes POST /api/v1/memory/recall.
 func (s *Server) handleRecall(w http.ResponseWriter, r *http.Request) {
 	var req model.RecallRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"error": "invalid JSON payload in recall request: " + err.Error(),
-		})
-		return
+	if r.Body != nil {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "failed reading request body: " + err.Error(),
+			})
+			return
+		}
+		if len(bytes.TrimSpace(bodyBytes)) > 0 {
+			if err := json.Unmarshal(bodyBytes, &req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"error": "invalid JSON payload in recall request: " + err.Error(),
+				})
+				return
+			}
+		}
+	}
+
+	// Parse URL query parameters to support and/or override request parameters
+	q := r.URL.Query()
+	if q.Has("include_embeddings") {
+		val := strings.ToLower(strings.TrimSpace(q.Get("include_embeddings")))
+		req.IncludeEmbeddings = (val == "true" || val == "1" || val == "yes")
+	}
+	if q.Has("fields") {
+		var queryFields []string
+		for _, fVal := range q["fields"] {
+			for _, f := range strings.Split(fVal, ",") {
+				clean := strings.TrimSpace(f)
+				if clean != "" {
+					queryFields = append(queryFields, clean)
+				}
+			}
+		}
+		if len(queryFields) > 0 {
+			req.Fields = queryFields
+		}
 	}
 
 	resp, err := s.engine.Recall(r.Context(), req)

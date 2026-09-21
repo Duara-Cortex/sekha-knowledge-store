@@ -600,12 +600,26 @@ func (e *Engine) Recall(ctx context.Context, req model.RecallRequest) (*model.Re
 		return nil, fmt.Errorf("failed fetching full nodes: %w", err)
 	}
 
+	// Check if embeddings should be retained
+	includeEmb := req.IncludeEmbeddings
+	if !includeEmb {
+		for _, f := range req.Fields {
+			if strings.EqualFold(strings.TrimSpace(f), "embedding") {
+				includeEmb = true
+				break
+			}
+		}
+	}
+
 	// Build scored node results in ranked order
 	scoredNodes := make([]model.ScoredNode, 0, len(topCandidates))
 	for _, tc := range topCandidates {
 		fullNode, exists := nodesMap[tc.id]
 		if !exists {
 			continue
+		}
+		if !includeEmb {
+			fullNode.Embedding = nil
 		}
 		scoredNodes = append(scoredNodes, model.ScoredNode{
 			Node:           fullNode,
@@ -643,10 +657,19 @@ func (e *Engine) Recall(ctx context.Context, req model.RecallRequest) (*model.Re
 
 	elapsed := float64(time.Since(start).Microseconds()) / 1000.0 // Latency in ms
 
+	var projectedNodes []map[string]any
+	if len(req.Fields) > 0 {
+		projectedNodes = make([]map[string]any, len(scoredNodes))
+		for i, sn := range scoredNodes {
+			projectedNodes[i] = sn.Project(req.Fields)
+		}
+	}
+
 	return &model.RecallResponse{
 		Nodes:          scoredNodes,
 		Edges:          subgraphEdges,
 		QueryLatencyMS: elapsed,
+		ProjectedNodes: projectedNodes,
 	}, nil
 }
 
