@@ -78,13 +78,15 @@ func (e *Extractor) Extract(trace model.EpisodicTrace) ExtractionResult {
 	}
 
 	goalID := fmt.Sprintf("task-%x", sha256.Sum256([]byte(goalText)))[:16]
+	goalSummary := fmt.Sprintf("Episodic task goal for deliberation session %s with outcome %s", trace.SessionID, res.Outcome)
 	goalEntity := model.ExtractedEntity{
-		ID:         goalID,
-		EntityType: "task_goal",
-		Label:      goalText,
-		Summary:    fmt.Sprintf("Episodic task goal for deliberation session %s with outcome %s", trace.SessionID, res.Outcome),
-		Embedding:  e.generateEmbedding(goalText),
-		Salience:   res.Salience,
+		ID:              goalID,
+		EntityType:      "task_goal",
+		Label:           goalText,
+		Summary:         goalSummary,
+		Embedding:       e.generateEmbedding(goalText),
+		Salience:        res.Salience,
+		ImportanceScore: computeImportance("task_goal", goalText, goalSummary, trace.Anchors),
 	}
 	res.Entities = append(res.Entities, goalEntity)
 	seenLabels[strings.ToLower(goalText)] = goalID
@@ -102,14 +104,16 @@ func (e *Extractor) Extract(trace model.EpisodicTrace) ExtractionResult {
 
 		stepKey := fmt.Sprintf("%s-step-%d-%s", trace.SessionID, step.StepIndex, step.Action)
 		stepID := fmt.Sprintf("dec-%x", sha256.Sum256([]byte(stepKey)))[:16]
+		stepLabel := fmt.Sprintf("Step %d: %s", step.StepIndex, truncateString(step.Action, 48))
 
 		stepEntity := model.ExtractedEntity{
-			ID:         stepID,
-			EntityType: "decision",
-			Label:      fmt.Sprintf("Step %d: %s", step.StepIndex, truncateString(step.Action, 48)),
-			Summary:    stepSummary,
-			Embedding:  e.generateEmbedding(stepSummary),
-			Salience:   res.Salience * 0.85,
+			ID:              stepID,
+			EntityType:      "decision",
+			Label:           stepLabel,
+			Summary:         stepSummary,
+			Embedding:       e.generateEmbedding(stepSummary),
+			Salience:        res.Salience * 0.85,
+			ImportanceScore: computeImportance("decision", stepLabel, stepSummary, trace.Anchors),
 		}
 		res.Entities = append(res.Entities, stepEntity)
 
@@ -141,14 +145,16 @@ func (e *Extractor) Extract(trace model.EpisodicTrace) ExtractionResult {
 			if !exists {
 				kwID = fmt.Sprintf("concept-%x", sha256.Sum256([]byte(lowerKw)))[:16]
 				seenLabels[lowerKw] = kwID
+				conceptSummary := fmt.Sprintf("Salient concept extracted from episodic deliberation: %s", kw)
 
 				res.Entities = append(res.Entities, model.ExtractedEntity{
-					ID:         kwID,
-					EntityType: "concept",
-					Label:      kw,
-					Summary:    fmt.Sprintf("Salient concept extracted from episodic deliberation: %s", kw),
-					Embedding:  e.generateEmbedding(kw),
-					Salience:   res.Salience * 0.7,
+					ID:              kwID,
+					EntityType:      "concept",
+					Label:           kw,
+					Summary:         conceptSummary,
+					Embedding:       e.generateEmbedding(kw),
+					Salience:        res.Salience * 0.7,
+					ImportanceScore: computeImportance("concept", kw, conceptSummary, trace.Anchors),
 				})
 			}
 
@@ -168,13 +174,15 @@ func (e *Extractor) Extract(trace model.EpisodicTrace) ExtractionResult {
 			continue
 		}
 		chunkID := fmt.Sprintf("sensory-%x", sha256.Sum256([]byte(chunk.Text)))[:16]
+		chunkLabel := truncateString(chunk.Text, 40)
 		chunkEntity := model.ExtractedEntity{
-			ID:         chunkID,
-			EntityType: "sensory_fact",
-			Label:      truncateString(chunk.Text, 40),
-			Summary:    chunk.Text,
-			Embedding:  e.generateEmbedding(chunk.Text),
-			Salience:   chunk.Salience * res.Salience,
+			ID:              chunkID,
+			EntityType:      "sensory_fact",
+			Label:           chunkLabel,
+			Summary:         chunk.Text,
+			Embedding:       e.generateEmbedding(chunk.Text),
+			Salience:        chunk.Salience * res.Salience,
+			ImportanceScore: computeImportance("sensory_fact", chunkLabel, chunk.Text, trace.Anchors),
 		}
 		res.Entities = append(res.Entities, chunkEntity)
 
@@ -187,6 +195,79 @@ func (e *Extractor) Extract(trace model.EpisodicTrace) ExtractionResult {
 	}
 
 	return res
+}
+
+// ComputeImportance calculates an intrinsic importance score in [0.0, 1.0] based on entity type,
+// semantic indicators in label and summary, and anchor tags.
+func ComputeImportance(entityType, label, summary string, anchors []string) float64 {
+	return computeImportance(entityType, label, summary, anchors)
+}
+
+// computeImportance assigns an intrinsic importance score based on heuristics:
+// - System config / architecture rule: 0.90
+// - Task goal: 0.85
+// - Decision / procedure: 0.75
+// - Anchor hubs (+0.15 boost, capped at 1.0, >= 0.85)
+// - Generic sensory / telemetry fact: 0.40 - 0.50 (0.45)
+// - Transient unanchored noise: 0.20 - 0.30 (0.25)
+func computeImportance(entityType, label, summary string, anchors []string) float64 {
+	eType := strings.ToLower(strings.TrimSpace(entityType))
+	lowerLabel := strings.ToLower(label)
+	lowerSummary := strings.ToLower(summary)
+
+	var score float64
+
+	// 1. System configs, architecture rules: >= 0.85 (default 0.90)
+	isConfigOrRule := eType == "system_config" || eType == "architecture_rule" || eType == "config" || eType == "rule" ||
+		strings.Contains(lowerLabel, "config") || strings.Contains(lowerLabel, "architecture") ||
+		strings.Contains(lowerLabel, "api_key") || strings.Contains(lowerLabel, "ingest_port") ||
+		strings.Contains(lowerLabel, "network bounds") || strings.Contains(lowerLabel, "master config") ||
+		strings.Contains(lowerSummary, "system config") || strings.Contains(lowerSummary, "architecture rule")
+
+	// 2. Task goals: >= 0.85
+	isGoal := eType == "task_goal" || strings.Contains(lowerLabel, "task goal")
+
+	// 3. Decisions and procedures: 0.70 - 0.85 (default 0.75)
+	isDecisionOrProc := eType == "decision" || eType == "procedure" ||
+		strings.Contains(lowerLabel, "decision") || strings.Contains(lowerLabel, "procedure") ||
+		strings.HasPrefix(lowerLabel, "step ")
+
+	// 4. Transient unanchored noise: 0.20 - 0.30 (default 0.25)
+	isTransientNoise := strings.Contains(lowerLabel, "jitter") || strings.Contains(lowerLabel, "transient") ||
+		strings.Contains(lowerLabel, "noise") || strings.Contains(lowerLabel, "ephemeral") ||
+		strings.Contains(lowerLabel, "speculative") || strings.Contains(lowerLabel, "debug log") ||
+		strings.Contains(lowerSummary, "transient") || strings.Contains(lowerSummary, "ephemeral") ||
+		strings.Contains(lowerSummary, "jitter")
+
+	// 5. Generic sensory / telemetry facts: 0.40 - 0.50 (default 0.45)
+	isSensoryOrTelemetry := eType == "sensory_fact" || eType == "telemetry" || eType == "telemetry_chunk" ||
+		eType == "telemetry_rule" || eType == "episodic_event" ||
+		strings.Contains(lowerLabel, "telemetry") || strings.Contains(lowerLabel, "sensor") ||
+		strings.Contains(lowerSummary, "telemetry")
+
+	if isConfigOrRule {
+		score = 0.90
+	} else if isGoal {
+		score = 0.85
+	} else if isDecisionOrProc {
+		score = 0.75
+	} else if isTransientNoise {
+		score = 0.25
+	} else if isSensoryOrTelemetry {
+		score = 0.45
+	} else {
+		score = 0.50
+	}
+
+	// Anchor tags boost: +0.15 for nodes with anchor tags (cap at 1.0)
+	if len(anchors) > 0 {
+		score += 0.15
+		if score > 1.0 {
+			score = 1.0
+		}
+	}
+
+	return score
 }
 
 // extractKeywords extracts distinctive tokens from a block of text.

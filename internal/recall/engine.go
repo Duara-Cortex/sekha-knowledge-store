@@ -16,9 +16,10 @@ import (
 
 // EngineConfig configures hyperparameter defaults, decay constants, and embedding clients.
 type EngineConfig struct {
-	DefaultAlpha        float64            // Semantic similarity weight w_sim (default: 0.6)
-	DefaultBeta         float64            // Usage frequency weight w_freq (default: 0.2)
-	DefaultGamma        float64            // Recency decay weight w_rec (default: 0.2)
+	DefaultAlpha        float64            // Semantic similarity weight w_sim (default: 0.50)
+	DefaultBeta         float64            // Usage frequency weight w_freq (default: 0.15)
+	DefaultGamma        float64            // Recency decay weight w_rec (default: 0.15)
+	DefaultImportance   float64            // Intrinsic importance weight w_imp (default: 0.20)
 	DefaultAnchorWeight float64            // Weight for anchor score bonus w_anc (default: 1.0)
 	DefaultHybridAlpha  float64            // Hybrid dense semantic vs BM25 weight (default: 0.65)
 	DecayHalfLife       time.Duration      // Time constant tau for recency decay (default: 24h)
@@ -32,9 +33,10 @@ type EngineConfig struct {
 // DefaultConfig provides balanced cognitive recall defaults.
 func DefaultConfig() EngineConfig {
 	return EngineConfig{
-		DefaultAlpha:        0.6,
-		DefaultBeta:         0.2,
-		DefaultGamma:        0.2,
+		DefaultAlpha:        0.50,
+		DefaultBeta:         0.15,
+		DefaultGamma:        0.15,
+		DefaultImportance:   0.20,
 		DefaultAnchorWeight: 1.0,
 		DefaultHybridAlpha:  0.65,
 		DecayHalfLife:       24 * time.Hour,
@@ -47,21 +49,22 @@ func DefaultConfig() EngineConfig {
 }
 
 type cachedNode struct {
-	id             string
-	entityType     string
-	label          string
-	summary        string
-	lowerLabel     string
-	lowerSummary   string
-	labelSet       map[string]bool
-	summarySet     map[string]bool
-	docLen         float64
-	embedding      []float32 // Pre-normalised to unit Euclidean length
-	magnitude      float32   // Always 1.0 for valid pre-normalised vectors
-	lastAccessedAt time.Time
-	accessCount    int64
-	stabilityScore float64
-	anchors        map[string]struct{}
+	id              string
+	entityType      string
+	label           string
+	summary         string
+	lowerLabel      string
+	lowerSummary    string
+	labelSet        map[string]bool
+	summarySet      map[string]bool
+	docLen          float64
+	embedding       []float32 // Pre-normalised to unit Euclidean length
+	magnitude       float32   // Always 1.0 for valid pre-normalised vectors
+	lastAccessedAt  time.Time
+	accessCount     int64
+	stabilityScore  float64
+	importanceScore float64
+	anchors         map[string]struct{}
 }
 
 func buildTokenSets(label, summary string) (string, string, map[string]bool, map[string]bool, float64) {
@@ -296,8 +299,11 @@ type Engine struct {
 
 // NewEngine creates and hydrates the associative recall engine from the underlying store.
 func NewEngine(ctx context.Context, s store.Store, cfg EngineConfig) (*Engine, error) {
-	if cfg.DefaultAlpha <= 0 && cfg.DefaultBeta <= 0 && cfg.DefaultGamma <= 0 {
+	if cfg.DefaultAlpha <= 0 && cfg.DefaultBeta <= 0 && cfg.DefaultGamma <= 0 && cfg.DefaultImportance <= 0 {
 		cfg = DefaultConfig()
+	}
+	if cfg.DefaultImportance <= 0 {
+		cfg.DefaultImportance = 0.20
 	}
 	if cfg.DefaultHybridAlpha <= 0 {
 		cfg.DefaultHybridAlpha = 0.65
@@ -385,21 +391,22 @@ func (e *Engine) Hydrate(ctx context.Context) error {
 		}
 
 		cn := &cachedNode{
-			id:             h.ID,
-			entityType:     h.EntityType,
-			label:          h.Label,
-			summary:        h.Summary,
-			lowerLabel:     lowerLabel,
-			lowerSummary:   lowerSummary,
-			labelSet:       labelSet,
-			summarySet:     summarySet,
-			docLen:         docLen,
-			embedding:      normEmb,
-			magnitude:      mag,
-			lastAccessedAt: h.LastAccessedAt,
-			accessCount:    h.AccessCount,
-			stabilityScore: h.StabilityScore,
-			anchors:        anchorSet,
+			id:              h.ID,
+			entityType:      h.EntityType,
+			label:           h.Label,
+			summary:         h.Summary,
+			lowerLabel:      lowerLabel,
+			lowerSummary:    lowerSummary,
+			labelSet:        labelSet,
+			summarySet:      summarySet,
+			docLen:          docLen,
+			embedding:       normEmb,
+			magnitude:       mag,
+			lastAccessedAt:  h.LastAccessedAt,
+			accessCount:     h.AccessCount,
+			stabilityScore:  h.StabilityScore,
+			importanceScore: h.ImportanceScore,
+			anchors:         anchorSet,
 		}
 		e.nodes[cn.id] = cn
 		e.index = append(e.index, cn)
@@ -472,6 +479,9 @@ func (e *Engine) RegisterNodes(nodes []model.Node) {
 				cn.magnitude = mag
 			}
 			cn.stabilityScore = n.StabilityScore
+			if n.ImportanceScore > 0 {
+				cn.importanceScore = n.ImportanceScore
+			}
 			if len(anchorSet) > 0 {
 				if cn.anchors == nil {
 					cn.anchors = make(map[string]struct{})
@@ -482,21 +492,22 @@ func (e *Engine) RegisterNodes(nodes []model.Node) {
 			}
 		} else {
 			cn = &cachedNode{
-				id:             n.ID,
-				entityType:     n.EntityType,
-				label:          n.Label,
-				summary:        n.Summary,
-				lowerLabel:     lowerLabel,
-				lowerSummary:   lowerSummary,
-				labelSet:       labelSet,
-				summarySet:     summarySet,
-				docLen:         docLen,
-				embedding:      normEmb,
-				magnitude:      mag,
-				lastAccessedAt: n.LastAccessedAt,
-				accessCount:    n.AccessCount,
-				stabilityScore: n.StabilityScore,
-				anchors:        anchorSet,
+				id:              n.ID,
+				entityType:      n.EntityType,
+				label:           n.Label,
+				summary:         n.Summary,
+				lowerLabel:      lowerLabel,
+				lowerSummary:    lowerSummary,
+				labelSet:        labelSet,
+				summarySet:      summarySet,
+				docLen:          docLen,
+				embedding:       normEmb,
+				magnitude:       mag,
+				lastAccessedAt:  n.LastAccessedAt,
+				accessCount:     n.AccessCount,
+				stabilityScore:  n.StabilityScore,
+				importanceScore: n.ImportanceScore,
+				anchors:         anchorSet,
 			}
 			e.nodes[n.ID] = cn
 			e.index = append(e.index, cn)
@@ -539,6 +550,7 @@ type candidateScore struct {
 	bm25Score    float64
 	freqScore    float64
 	recencyScore float64
+	impScore     float64
 	anchorScore  float64
 	hopDistance  int
 }
@@ -553,22 +565,31 @@ func (e *Engine) Recall(ctx context.Context, req model.RecallRequest) (*model.Re
 		topK = 5
 	}
 
-	alpha := req.Alpha
-	beta := req.Beta
-	gamma := req.Gamma
-	if alpha == 0 && beta == 0 && gamma == 0 {
-		alpha = e.cfg.DefaultAlpha
-		beta = e.cfg.DefaultBeta
-		gamma = e.cfg.DefaultGamma
+	wSim := req.Alpha
+	wFreq := req.Beta
+	wRec := req.Gamma
+	wImp := req.WeightImportance
+
+	if wSim == 0 && wFreq == 0 && wRec == 0 && wImp == 0 {
+		wSim = e.cfg.DefaultAlpha
+		wRec = e.cfg.DefaultGamma
+		wImp = e.cfg.DefaultImportance
+		wFreq = e.cfg.DefaultBeta
+	} else if wImp > 0 && wSim == 0 && wFreq == 0 && wRec == 0 {
+		wSim = e.cfg.DefaultAlpha
+		wRec = e.cfg.DefaultGamma
+		wFreq = e.cfg.DefaultBeta
 	}
+
 	// Normalise weights
-	totalWeight := alpha + beta + gamma
+	totalWeight := wSim + wFreq + wRec + wImp
 	if totalWeight > 0 {
-		alpha /= totalWeight
-		beta /= totalWeight
-		gamma /= totalWeight
+		wSim /= totalWeight
+		wFreq /= totalWeight
+		wRec /= totalWeight
+		wImp /= totalWeight
 	} else {
-		alpha, beta, gamma = 0.6, 0.2, 0.2
+		wSim, wRec, wImp, wFreq = 0.50, 0.15, 0.20, 0.15
 	}
 
 	// Rehydrate in-memory index if empty
@@ -757,15 +778,23 @@ func (e *Engine) Recall(ctx context.Context, req model.RecallRequest) (*model.Re
 			}
 		}
 
-		// Combined Base Score: R(node) = alpha*Sim + beta*Freq + gamma*Recency
-		rScore := alpha*simScore + beta*freqScore + gamma*recencyScore
+		// 4. Intrinsic Importance: clamped to [0.0, 1.0]
+		impScore := cn.importanceScore
+		if impScore < 0.0 {
+			impScore = 0.0
+		} else if impScore > 1.0 {
+			impScore = 1.0
+		}
+
+		// Combined Base Score: Score(v | q) = w_sim S_sim + w_rec S_rec + w_imp S_imp + w_freq S_freq
+		rScore := wSim*simScore + wRec*recencyScore + wImp*impScore + wFreq*freqScore
 
 		// Factor in node stability score
 		if cn.stabilityScore > 0 && cn.stabilityScore != 1.0 {
 			rScore *= (0.8 + 0.2*cn.stabilityScore)
 		}
 
-		// 4. Anchor Matching & Scoring
+		// 5. Anchor Matching & Scoring
 		matchesAnchor := false
 		if len(queryAnchors) > 0 {
 			for _, qa := range queryAnchors {
@@ -785,7 +814,7 @@ func (e *Engine) Recall(ctx context.Context, req model.RecallRequest) (*model.Re
 			anchorScore = 1.0
 		}
 
-		// Score(v | q, anchors) = w_sim S_sim + w_rec S_rec + w_freq S_freq + w_anc S_anchor
+		// Score(v | q, anchors) = w_sim S_sim + w_rec S_rec + w_imp S_imp + w_freq S_freq + w_anc S_anchor
 		totalScore := rScore + (wAnc * anchorScore)
 
 		cs := &candidateScore{
@@ -797,6 +826,7 @@ func (e *Engine) Recall(ctx context.Context, req model.RecallRequest) (*model.Re
 			bm25Score:    bm25Sim,
 			freqScore:    freqScore,
 			recencyScore: recencyScore,
+			impScore:     impScore,
 			anchorScore:  anchorScore,
 			hopDistance:  0,
 		}
@@ -962,15 +992,16 @@ func (e *Engine) Recall(ctx context.Context, req model.RecallRequest) (*model.Re
 		dScore := math.Round(tc.denseScore*10000) / 10000
 		bScore := math.Round(tc.bm25Score*10000) / 10000
 		scoredNodes = append(scoredNodes, model.ScoredNode{
-			Node:           fullNode,
-			Score:          math.Round(tc.totalScore*10000) / 10000,
-			SimScore:       math.Round(tc.simScore*10000) / 10000,
-			DenseScore:     &dScore,
-			BM25Score:      &bScore,
-			FrequencyScore: math.Round(tc.freqScore*10000) / 10000,
-			RecencyScore:   math.Round(tc.recencyScore*10000) / 10000,
-			AnchorScore:    math.Round(tc.anchorScore*10000) / 10000,
-			HopDistance:    tc.hopDistance,
+			Node:            fullNode,
+			Score:           math.Round(tc.totalScore*10000) / 10000,
+			SimScore:        math.Round(tc.simScore*10000) / 10000,
+			DenseScore:      &dScore,
+			BM25Score:       &bScore,
+			FrequencyScore:  math.Round(tc.freqScore*10000) / 10000,
+			RecencyScore:    math.Round(tc.recencyScore*10000) / 10000,
+			ImportanceScore: math.Round(tc.impScore*10000) / 10000,
+			AnchorScore:     math.Round(tc.anchorScore*10000) / 10000,
+			HopDistance:     tc.hopDistance,
 		})
 	}
 

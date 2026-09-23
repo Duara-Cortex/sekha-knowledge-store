@@ -18,10 +18,11 @@ import (
 )
 
 type apiMockStore struct {
-	nodes   map[string]model.Node
-	edges   []model.Edge
-	headers []store.NodeHeader
-	anchors map[string][]string
+	nodes              map[string]model.Node
+	edges              []model.Edge
+	headers            []store.NodeHeader
+	anchors            map[string][]string
+	applyScopedDecayFn func(ctx context.Context, req model.DecayRequest, refTime time.Time) (int, int, int, int, error)
 }
 
 func newAPIMockStore() *apiMockStore {
@@ -90,18 +91,24 @@ func (m *apiMockStore) InsertNodes(ctx context.Context, nodes []model.Node) (int
 		}
 		m.nodes[n.ID] = n
 		m.headers = append(m.headers, store.NodeHeader{
-			ID:             n.ID,
-			EntityType:     n.EntityType,
-			Label:          n.Label,
-			Summary:        n.Summary,
-			Embedding:      n.Embedding,
-			LastAccessedAt: n.LastAccessedAt,
-			AccessCount:    n.AccessCount,
-			StabilityScore: n.StabilityScore,
-			Anchors:        m.anchors[n.ID],
+			ID:              n.ID,
+			EntityType:      n.EntityType,
+			Label:           n.Label,
+			Summary:         n.Summary,
+			Embedding:       n.Embedding,
+			LastAccessedAt:  n.LastAccessedAt,
+			AccessCount:     n.AccessCount,
+			StabilityScore:  n.StabilityScore,
+			ImportanceScore: n.ImportanceScore,
+			Anchors:         m.anchors[n.ID],
 		})
 	}
 	return len(nodes), nil
+}
+
+func (m *apiMockStore) UpsertNode(ctx context.Context, node model.Node) error {
+	_, err := m.InsertNodes(ctx, []model.Node{node})
+	return err
 }
 
 func (m *apiMockStore) InsertEdges(ctx context.Context, edges []model.Edge) (int, error) {
@@ -131,6 +138,17 @@ func (m *apiMockStore) GetNodes(ctx context.Context, ids []string) (map[string]m
 
 func (m *apiMockStore) GetAllNodeHeaders(ctx context.Context) ([]store.NodeHeader, error) {
 	return m.headers, nil
+}
+
+func (m *apiMockStore) GetAllActiveNodes(ctx context.Context) ([]model.Node, error) {
+	res := make([]model.Node, 0, len(m.nodes))
+	for _, n := range m.nodes {
+		if !n.IsArchived {
+			n.Anchors = m.anchors[n.ID]
+			res = append(res, n)
+		}
+	}
+	return res, nil
 }
 
 func (m *apiMockStore) GetEdgesForNodes(ctx context.Context, nodeIDs []string) ([]model.Edge, error) {
@@ -198,6 +216,13 @@ func (m *apiMockStore) BoostNodeStability(ctx context.Context, nodeID string, de
 
 func (m *apiMockStore) ApplyDecayAndPrune(ctx context.Context, cfg model.DecayConfig, refTime time.Time) (decayed int, archived int, prunedEdges int, err error) {
 	return 0, 0, 0, nil
+}
+
+func (m *apiMockStore) ApplyScopedDecay(ctx context.Context, req model.DecayRequest, refTime time.Time) (decayed int, archived int, prunedEdges int, protected int, err error) {
+	if m.applyScopedDecayFn != nil {
+		return m.applyScopedDecayFn(ctx, req, refTime)
+	}
+	return 0, 0, 0, 0, nil
 }
 
 func (m *apiMockStore) GetConsolidationStats(ctx context.Context) (*model.ConsolidationStats, error) {
@@ -1345,3 +1370,77 @@ func TestAPIRecall_GatedNeighbourExpansionQueryParameters(t *testing.T) {
 	}
 }
 
+func TestHandleDecayEndpoint(t *testing.T) {
+	ctx := context.Background()
+	ms := newAPIMockStore()
+
+	var receivedReq model.DecayRequest
+	ms.applyScopedDecayFn = func(ctx context.Context, req model.DecayRequest, refTime time.Time) (int, int, int, int, error) {
+		receivedReq = req
+		return 3, 10, 2, 5, nil
+	}
+
+	engine, err := recall.NewEngine(ctx, ms, recall.DefaultConfig())
+	if err != nil {
+		t.Fatalf("engine initialisation failed: %v", err)
+	}
+
+	server := NewServer(ms, engine, 8084)
+
+	endpoints := []string{
+		"/api/v1/consolidation/decay",
+		"/api/v1/memory/decay",
+	}
+
+	payload := `{
+		"scope": "unanchored",
+		"inactivity_grace_period": "0s",
+		"decay_half_life": "1h",
+		"min_importance_to_retain": 0.80
+	}`
+
+	for _, ep := range endpoints {
+		httpReq := httptest.NewRequest(http.MethodPost, ep, bytes.NewReader([]byte(payload)))
+		httpReq.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, httpReq)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s returned status %d: %s", ep, rec.Code, rec.Body.String())
+		}
+
+		var resp model.DecayResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed unmarshaling decay response: %v", err)
+		}
+
+		if resp.Status != "success" {
+			t.Errorf("expected status success, got %s", resp.Status)
+		}
+		if resp.Scope != "unanchored" {
+			t.Errorf("expected scope unanchored, got %s", resp.Scope)
+		}
+		if resp.NodesArchived != 10 {
+			t.Errorf("expected 10 nodes archived, got %d", resp.NodesArchived)
+		}
+		if resp.NodesDecayed != 3 {
+			t.Errorf("expected 3 nodes decayed, got %d", resp.NodesDecayed)
+		}
+		if resp.EdgesPruned != 2 {
+			t.Errorf("expected 2 edges pruned, got %d", resp.EdgesPruned)
+		}
+		if resp.ProtectedNodes != 5 {
+			t.Errorf("expected 5 protected nodes, got %d", resp.ProtectedNodes)
+		}
+
+		if receivedReq.Scope != "unanchored" {
+			t.Errorf("expected received scope unanchored, got %s", receivedReq.Scope)
+		}
+		if receivedReq.InactivityGracePeriod == nil || *receivedReq.InactivityGracePeriod != 0 {
+			t.Errorf("expected 0s grace period, got %v", receivedReq.InactivityGracePeriod)
+		}
+		if receivedReq.DecayHalfLife == nil || *receivedReq.DecayHalfLife != time.Hour {
+			t.Errorf("expected 1h decay half life, got %v", receivedReq.DecayHalfLife)
+		}
+	}
+}

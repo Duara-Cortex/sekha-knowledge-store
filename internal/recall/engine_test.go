@@ -112,19 +112,25 @@ func (m *mockStore) InsertNodes(ctx context.Context, nodes []model.Node) (int, e
 			mag = float32(math.Sqrt(sum))
 		}
 		m.headers = append(m.headers, store.NodeHeader{
-			ID:             n.ID,
-			EntityType:     n.EntityType,
-			Label:          n.Label,
-			Summary:        n.Summary,
-			Embedding:      n.Embedding,
-			Magnitude:      mag,
-			LastAccessedAt: n.LastAccessedAt,
-			AccessCount:    n.AccessCount,
-			StabilityScore: n.StabilityScore,
-			Anchors:        m.anchors[n.ID],
+			ID:              n.ID,
+			EntityType:      n.EntityType,
+			Label:           n.Label,
+			Summary:         n.Summary,
+			Embedding:       n.Embedding,
+			Magnitude:       mag,
+			LastAccessedAt:  n.LastAccessedAt,
+			AccessCount:     n.AccessCount,
+			StabilityScore:  n.StabilityScore,
+			ImportanceScore: n.ImportanceScore,
+			Anchors:         m.anchors[n.ID],
 		})
 	}
 	return len(nodes), nil
+}
+
+func (m *mockStore) UpsertNode(ctx context.Context, node model.Node) error {
+	_, err := m.InsertNodes(ctx, []model.Node{node})
+	return err
 }
 
 func (m *mockStore) InsertEdges(ctx context.Context, edges []model.Edge) (int, error) {
@@ -163,6 +169,19 @@ func (m *mockStore) GetAllNodeHeaders(ctx context.Context) ([]store.NodeHeader, 
 	defer m.mu.RUnlock()
 	res := make([]store.NodeHeader, len(m.headers))
 	copy(res, m.headers)
+	return res, nil
+}
+
+func (m *mockStore) GetAllActiveNodes(ctx context.Context) ([]model.Node, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	res := make([]model.Node, 0, len(m.nodes))
+	for _, n := range m.nodes {
+		if !n.IsArchived {
+			n.Anchors = m.anchors[n.ID]
+			res = append(res, n)
+		}
+	}
 	return res, nil
 }
 
@@ -243,6 +262,10 @@ func (m *mockStore) BoostNodeStability(ctx context.Context, nodeID string, delta
 
 func (m *mockStore) ApplyDecayAndPrune(ctx context.Context, cfg model.DecayConfig, refTime time.Time) (decayed int, archived int, prunedEdges int, err error) {
 	return 0, 0, 0, nil
+}
+
+func (m *mockStore) ApplyScopedDecay(ctx context.Context, req model.DecayRequest, refTime time.Time) (decayed int, archived int, prunedEdges int, protected int, err error) {
+	return 0, 0, 0, 0, nil
 }
 
 func (m *mockStore) GetConsolidationStats(ctx context.Context) (*model.ConsolidationStats, error) {
@@ -1579,3 +1602,76 @@ func TestRecallEngine_DisplacementGuard(t *testing.T) {
 	}
 }
 
+func TestFrequencyStarvationProtection(t *testing.T) {
+	ctx := context.Background()
+	ms := newMockStore()
+
+	now := time.Now().UTC()
+
+	// Target Node A: Critical system configuration, committed once, rarely queried
+	nodeA := model.Node{
+		ID:              "node-cluster-master-config",
+		EntityType:      "concept",
+		Label:           "Cluster Master Config",
+		Summary:         "INGEST_PORT and API_KEY bindings for cluster master nodes",
+		ImportanceScore: 0.90,
+		AccessCount:     1,
+		StabilityScore:  1.0,
+		CreatedAt:       now.Add(-24 * time.Hour),
+		LastAccessedAt:  now.Add(-24 * time.Hour),
+	}
+
+	// Distractor Node B: Noisy debug log, high access count, low importance
+	nodeB := model.Node{
+		ID:              "node-noisy-debug-log",
+		EntityType:      "telemetry",
+		Label:           "Noisy Debug Log",
+		Summary:         "Cluster master debug logs and network packets",
+		ImportanceScore: 0.25,
+		AccessCount:     50,
+		StabilityScore:  1.0,
+		CreatedAt:       now.Add(-1 * time.Hour),
+		LastAccessedAt:  now.Add(-1 * time.Hour),
+	}
+
+	_, err := ms.InsertNodes(ctx, []model.Node{nodeA, nodeB})
+	if err != nil {
+		t.Fatalf("failed inserting test nodes: %v", err)
+	}
+
+	engine, err := NewEngine(ctx, ms, DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed creating recall engine: %v", err)
+	}
+
+	// Recall query matching both nodes' domain (semantic match on "Cluster Master Config")
+	resp, err := engine.Recall(ctx, model.RecallRequest{
+		Query: "Cluster Master Config",
+		TopK:  2,
+	})
+	if err != nil {
+		t.Fatalf("Recall failed: %v", err)
+	}
+
+	if len(resp.Nodes) < 2 {
+		t.Fatalf("expected 2 recalled nodes, got %d", len(resp.Nodes))
+	}
+
+	// Node A (imp=0.90, access=1) MUST decisively outrank Node B (imp=0.25, access=50)
+	if resp.Nodes[0].ID != "node-cluster-master-config" {
+		t.Fatalf("expected node-cluster-master-config at Rank 1, got %s (Rank 1 score: %f, Rank 2 score: %f)",
+			resp.Nodes[0].ID, resp.Nodes[0].Score, resp.Nodes[1].Score)
+	}
+
+	if resp.Nodes[0].ImportanceScore != 0.90 {
+		t.Errorf("expected Rank 1 ImportanceScore 0.90, got %f", resp.Nodes[0].ImportanceScore)
+	}
+	if resp.Nodes[1].ImportanceScore != 0.25 {
+		t.Errorf("expected Rank 2 ImportanceScore 0.25, got %f", resp.Nodes[1].ImportanceScore)
+	}
+
+	t.Logf("Rank 1: %s (Score: %.4f, Imp: %.2f, Freq: %.4f)",
+		resp.Nodes[0].ID, resp.Nodes[0].Score, resp.Nodes[0].ImportanceScore, resp.Nodes[0].FrequencyScore)
+	t.Logf("Rank 2: %s (Score: %.4f, Imp: %.2f, Freq: %.4f)",
+		resp.Nodes[1].ID, resp.Nodes[1].Score, resp.Nodes[1].ImportanceScore, resp.Nodes[1].FrequencyScore)
+}

@@ -76,6 +76,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/memory/recall", s.handleRecall)
 	s.mux.HandleFunc("POST /api/v1/memory/insert", s.handleInsert)
 	s.mux.HandleFunc("POST /api/v1/memory/consolidate", s.handleConsolidate)
+	s.mux.HandleFunc("POST /api/v1/consolidation/decay", s.handleDecay)
+	s.mux.HandleFunc("POST /api/v1/memory/decay", s.handleDecay)
 	s.mux.HandleFunc("GET /api/v1/memory/consolidation/stats", s.handleConsolidationStats)
 	s.mux.HandleFunc("GET /api/v1/memory/graph", s.handleGraph)
 	s.mux.HandleFunc("GET /api/v1/memory/health", s.handleHealth)
@@ -393,4 +395,33 @@ func (s *Server) handleConsolidationStats(w http.ResponseWriter, r *http.Request
 
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(stats)
+}
+
+// handleDecay processes POST /api/v1/consolidation/decay and POST /api/v1/memory/decay.
+func (s *Server) handleDecay(w http.ResponseWriter, r *http.Request) {
+	var req model.DecayRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "invalid JSON payload: " + err.Error(),
+		})
+		return
+	}
+
+	res, err := s.consolidationEngine.ExecuteScopedDecay(r.Context(), req, time.Now().UTC())
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "scoped decay failed: " + err.Error(),
+		})
+		return
+	}
+
+	// Rehydrate in-memory recall engine if nodes were soft-archived
+	if res.NodesArchived > 0 && s.engine != nil {
+		_ = s.engine.Hydrate(r.Context())
+	}
+
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(res)
 }

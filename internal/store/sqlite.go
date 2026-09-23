@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -89,13 +90,13 @@ func (s *SQLiteStore) initPragmasAndSchema() error {
 		archived_at TIMESTAMP,
 		access_count INTEGER NOT NULL DEFAULT 0,
 		stability_score REAL NOT NULL DEFAULT 1.0,
+		importance_score REAL NOT NULL DEFAULT 0.5,
 		is_archived INTEGER NOT NULL DEFAULT 0
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_nodes_entity_type ON nodes(entity_type);
 	CREATE INDEX IF NOT EXISTS idx_nodes_last_accessed ON nodes(last_accessed_at);
 	CREATE INDEX IF NOT EXISTS idx_nodes_access_count ON nodes(access_count);
-	CREATE INDEX IF NOT EXISTS idx_nodes_archived ON nodes(is_archived, stability_score);
 
 	CREATE TABLE IF NOT EXISTS edges (
 		source_id TEXT NOT NULL,
@@ -145,6 +146,9 @@ func (s *SQLiteStore) initPragmasAndSchema() error {
 		"ALTER TABLE nodes ADD COLUMN is_archived INTEGER NOT NULL DEFAULT 0;",
 		"ALTER TABLE nodes ADD COLUMN archived_at TIMESTAMP;",
 		"ALTER TABLE nodes ADD COLUMN last_reinforced_at TIMESTAMP;",
+		"ALTER TABLE nodes ADD COLUMN importance_score REAL NOT NULL DEFAULT 0.5;",
+		"CREATE INDEX IF NOT EXISTS idx_nodes_importance ON nodes(importance_score);",
+		"CREATE INDEX IF NOT EXISTS idx_nodes_archived ON nodes(is_archived, stability_score);",
 		"ALTER TABLE edges ADD COLUMN last_reinforced_at TIMESTAMP;",
 		`CREATE TABLE IF NOT EXISTS node_anchors (
 			node_id TEXT NOT NULL,
@@ -180,14 +184,15 @@ func (s *SQLiteStore) InsertNodes(ctx context.Context, nodes []model.Node) (int,
 	defer func() { _ = tx.Rollback() }()
 
 	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO nodes (id, entity_type, label, summary, embedding, created_at, last_accessed_at, last_reinforced_at, archived_at, access_count, stability_score, is_archived)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO nodes (id, entity_type, label, summary, embedding, created_at, last_accessed_at, last_reinforced_at, archived_at, access_count, stability_score, importance_score, is_archived)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			entity_type = excluded.entity_type,
 			label = excluded.label,
 			summary = excluded.summary,
 			embedding = coalesce(excluded.embedding, nodes.embedding),
 			stability_score = excluded.stability_score,
+			importance_score = max(excluded.importance_score, nodes.importance_score),
 			last_accessed_at = excluded.last_accessed_at,
 			last_reinforced_at = coalesce(excluded.last_reinforced_at, nodes.last_reinforced_at),
 			archived_at = excluded.archived_at,
@@ -227,6 +232,10 @@ func (s *SQLiteStore) InsertNodes(ctx context.Context, nodes []model.Node) (int,
 		if stability <= 0 {
 			stability = 1.0
 		}
+		importance := n.ImportanceScore
+		if importance <= 0 {
+			importance = 0.5
+		}
 
 		blob := EncodeEmbedding(n.Embedding)
 
@@ -257,6 +266,7 @@ func (s *SQLiteStore) InsertNodes(ctx context.Context, nodes []model.Node) (int,
 			archivedStr,
 			n.AccessCount,
 			stability,
+			importance,
 			isArchivedInt,
 		)
 		if err != nil {
@@ -280,6 +290,12 @@ func (s *SQLiteStore) InsertNodes(ctx context.Context, nodes []model.Node) (int,
 		return 0, err
 	}
 	return inserted, nil
+}
+
+// UpsertNode inserts or updates a single node in the SQLite nodes table.
+func (s *SQLiteStore) UpsertNode(ctx context.Context, node model.Node) error {
+	_, err := s.InsertNodes(ctx, []model.Node{node})
+	return err
 }
 
 // InsertEdges upserts edges into the SQLite edges table.
@@ -521,6 +537,7 @@ func scanNodeFromRow(row interface{ Scan(dest ...any) error }) (*model.Node, err
 		&archivedStr,
 		&n.AccessCount,
 		&n.StabilityScore,
+		&n.ImportanceScore,
 		&isArchivedInt,
 	)
 	if err != nil {
@@ -552,7 +569,7 @@ func scanNodeFromRow(row interface{ Scan(dest ...any) error }) (*model.Node, err
 // GetNode retrieves a single node by its ID.
 func (s *SQLiteStore) GetNode(ctx context.Context, id string) (*model.Node, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, entity_type, label, summary, embedding, created_at, last_accessed_at, last_reinforced_at, archived_at, access_count, stability_score, is_archived
+		SELECT id, entity_type, label, summary, embedding, created_at, last_accessed_at, last_reinforced_at, archived_at, access_count, stability_score, importance_score, is_archived
 		FROM nodes WHERE id = ?
 	`, id)
 
@@ -597,7 +614,7 @@ func (s *SQLiteStore) GetNodes(ctx context.Context, ids []string) (map[string]mo
 		}
 
 		query := fmt.Sprintf(`
-			SELECT id, entity_type, label, summary, embedding, created_at, last_accessed_at, last_reinforced_at, archived_at, access_count, stability_score, is_archived
+			SELECT id, entity_type, label, summary, embedding, created_at, last_accessed_at, last_reinforced_at, archived_at, access_count, stability_score, importance_score, is_archived
 			FROM nodes WHERE id IN (%s)
 		`, placeholders)
 
@@ -659,7 +676,7 @@ func (s *SQLiteStore) GetAllNodeHeaders(ctx context.Context) ([]NodeHeader, erro
 	}
 
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, entity_type, label, summary, embedding, last_accessed_at, access_count, stability_score, is_archived
+		SELECT id, entity_type, label, summary, embedding, last_accessed_at, access_count, stability_score, importance_score, is_archived
 		FROM nodes
 		WHERE is_archived = 0
 	`)
@@ -684,6 +701,7 @@ func (s *SQLiteStore) GetAllNodeHeaders(ctx context.Context) ([]NodeHeader, erro
 			&accessedStr,
 			&h.AccessCount,
 			&h.StabilityScore,
+			&h.ImportanceScore,
 			&isArchivedInt,
 		); err != nil {
 			return nil, err
@@ -706,6 +724,46 @@ func (s *SQLiteStore) GetAllNodeHeaders(ctx context.Context) ([]NodeHeader, erro
 	}
 
 	return headers, nil
+}
+
+// GetAllActiveNodes scans full active nodes with anchors populated from SQLite.
+func (s *SQLiteStore) GetAllActiveNodes(ctx context.Context) ([]model.Node, error) {
+	anchorsMap := make(map[string][]string)
+	anchorRows, err := s.db.QueryContext(ctx, `
+		SELECT node_id, anchor_tag
+		FROM node_anchors
+		ORDER BY anchor_tag ASC
+	`)
+	if err == nil {
+		for anchorRows.Next() {
+			var nodeID, tag string
+			if err := anchorRows.Scan(&nodeID, &tag); err == nil {
+				anchorsMap[nodeID] = append(anchorsMap[nodeID], tag)
+			}
+		}
+		anchorRows.Close()
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, entity_type, label, summary, embedding, created_at, last_accessed_at, last_reinforced_at, archived_at, access_count, stability_score, importance_score, is_archived
+		FROM nodes
+		WHERE is_archived = 0
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var nodes []model.Node
+	for rows.Next() {
+		n, err := scanNodeFromRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		n.Anchors = anchorsMap[n.ID]
+		nodes = append(nodes, *n)
+	}
+	return nodes, nil
 }
 
 // GetEdgesForNodes finds all edges originating from or pointing to any of the specified node IDs.
@@ -870,7 +928,7 @@ func (s *SQLiteStore) FindMatchingNode(ctx context.Context, label string, entity
 	}
 
 	query := `
-		SELECT id, entity_type, label, summary, embedding, created_at, last_accessed_at, last_reinforced_at, archived_at, access_count, stability_score, is_archived
+		SELECT id, entity_type, label, summary, embedding, created_at, last_accessed_at, last_reinforced_at, archived_at, access_count, stability_score, importance_score, is_archived
 		FROM nodes
 		WHERE lower(label) = lower(?) AND is_archived = 0
 	`
@@ -1194,6 +1252,227 @@ func (s *SQLiteStore) ApplyDecayAndPrune(ctx context.Context, cfg model.DecayCon
 	}
 
 	return decayed, archived, prunedEdges, nil
+}
+
+// ApplyScopedDecay executes task/session-scoped accelerated decay and immediate soft-archiving of unanchored or low-salience nodes.
+func (s *SQLiteStore) ApplyScopedDecay(ctx context.Context, req model.DecayRequest, refTime time.Time) (decayed int, archived int, prunedEdges int, protected int, err error) {
+	if refTime.IsZero() {
+		refTime = time.Now().UTC()
+	}
+
+	minImportance := req.MinImportanceToRetain
+	if minImportance <= 0 {
+		minImportance = 0.80
+	}
+
+	decayHalfLife := 72 * time.Hour
+	if req.DecayHalfLife != nil && *req.DecayHalfLife > 0 {
+		decayHalfLife = *req.DecayHalfLife
+	}
+
+	var gracePeriod time.Duration
+	if req.InactivityGracePeriod != nil {
+		gracePeriod = *req.InactivityGracePeriod
+	}
+
+	pruneThreshold := minImportance
+	if req.PruneThreshold != nil {
+		pruneThreshold = *req.PruneThreshold
+	}
+	if pruneThreshold <= 0 {
+		pruneThreshold = 0.10
+	}
+
+	scope := strings.ToLower(strings.TrimSpace(req.Scope))
+	if scope == "" {
+		scope = "all"
+	}
+
+	sessionNodeIDs := make(map[string]struct{})
+	if scope == "session" && req.SessionID != "" {
+		traceRows, err := s.db.QueryContext(ctx, `
+			SELECT trace_payload
+			FROM episodic_traces
+			WHERE session_id = ?
+		`, req.SessionID)
+		if err == nil {
+			for traceRows.Next() {
+				var payload string
+				if err := traceRows.Scan(&payload); err == nil {
+					var trace model.EpisodicTrace
+					if json.Unmarshal([]byte(payload), &trace) == nil {
+						if trace.TaskGoal != "" {
+							goalID := fmt.Sprintf("task-%x", sha256.Sum256([]byte(trace.TaskGoal)))[:16]
+							sessionNodeIDs[goalID] = struct{}{}
+						}
+						for _, step := range trace.Trajectory {
+							stepKey := fmt.Sprintf("%s-step-%d-%s", trace.SessionID, step.StepIndex, step.Action)
+							stepID := fmt.Sprintf("dec-%x", sha256.Sum256([]byte(stepKey)))[:16]
+							sessionNodeIDs[stepID] = struct{}{}
+						}
+						for _, sc := range trace.SensoryContext {
+							chunkID := fmt.Sprintf("sensory-%x", sha256.Sum256([]byte(sc.Text)))[:16]
+							sessionNodeIDs[chunkID] = struct{}{}
+						}
+					}
+				}
+			}
+			traceRows.Close()
+		}
+	}
+
+	// 1. Fetch active nodes with anchor counts
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT n.id, n.entity_type, n.label, n.summary, n.created_at, n.last_accessed_at, n.last_reinforced_at, n.stability_score, n.importance_score,
+		       (SELECT COUNT(*) FROM node_anchors WHERE node_id = n.id) AS anchor_count
+		FROM nodes n
+		WHERE n.is_archived = 0
+	`)
+	if err != nil {
+		return 0, 0, 0, 0, fmt.Errorf("failed querying nodes for scoped decay: %w", err)
+	}
+
+	type decayTarget struct {
+		id           string
+		newStability float64
+		shouldPrune  bool
+	}
+	var targets []decayTarget
+
+	lambda := math.Ln2 / decayHalfLife.Seconds()
+	gracePeriodSec := gracePeriod.Seconds()
+
+	for rows.Next() {
+		var id, entityType, label, summary string
+		var createdStr, accessedStr string
+		var reinforcedStr sql.NullString
+		var stability, importance float64
+		var anchorCount int
+
+		if err := rows.Scan(&id, &entityType, &label, &summary, &createdStr, &accessedStr, &reinforcedStr, &stability, &importance, &anchorCount); err != nil {
+			rows.Close()
+			return 0, 0, 0, 0, err
+		}
+
+		// Protection Rule: Nodes with anchors or importance_score >= minImportance are immune to accelerated decay.
+		if anchorCount > 0 || importance >= minImportance {
+			protected++
+			continue
+		}
+
+		// Scope filtering for unprotected nodes
+		switch scope {
+		case "unanchored":
+			if anchorCount > 0 {
+				continue
+			}
+		case "session":
+			_, inSession := sessionNodeIDs[id]
+			if !inSession && !strings.Contains(summary, req.SessionID) && !strings.Contains(label, req.SessionID) {
+				continue
+			}
+		case "transient":
+			isTransient := importance <= 0.50 ||
+				entityType == "sensory_fact" ||
+				entityType == "telemetry" ||
+				entityType == "telemetry_chunk" ||
+				entityType == "telemetry_rule" ||
+				entityType == "episodic_event" ||
+				entityType == "noise" ||
+				strings.Contains(strings.ToLower(label), "transient") ||
+				strings.Contains(strings.ToLower(label), "noise") ||
+				strings.Contains(strings.ToLower(label), "jitter")
+			if !isTransient {
+				continue
+			}
+		case "all":
+			// Process all unprotected nodes
+		}
+
+		lastTime := refTime
+		if t, err := time.Parse(time.RFC3339Nano, accessedStr); err == nil {
+			lastTime = t
+		}
+		if reinforcedStr.Valid {
+			if t, err := time.Parse(time.RFC3339Nano, reinforcedStr.String); err == nil {
+				if t.After(lastTime) {
+					lastTime = t
+				}
+			}
+		}
+
+		elapsedSeconds := refTime.Sub(lastTime).Seconds()
+		if elapsedSeconds < 0 {
+			elapsedSeconds = 0
+		}
+
+		decayFactor := math.Exp(-lambda * elapsedSeconds)
+		decayedStability := stability * decayFactor
+
+		// Exponential decay: if elapsed >= gracePeriod && (newStability < pruneThreshold || importance < pruneThreshold)
+		shouldPrune := elapsedSeconds >= gracePeriodSec && (decayedStability < pruneThreshold || importance < pruneThreshold)
+
+		targets = append(targets, decayTarget{
+			id:           id,
+			newStability: decayedStability,
+			shouldPrune:  shouldPrune,
+		})
+	}
+	rows.Close()
+
+	// 2. Commit batch updates in transaction
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	stmtUpdate, err := tx.PrepareContext(ctx, `UPDATE nodes SET stability_score = ? WHERE id = ?`)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	defer stmtUpdate.Close()
+
+	stmtArchive, err := tx.PrepareContext(ctx, `UPDATE nodes SET stability_score = ?, is_archived = 1, archived_at = ? WHERE id = ?`)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	defer stmtArchive.Close()
+
+	refTimeStr := refTime.Format(time.RFC3339Nano)
+
+	for _, item := range targets {
+		if item.shouldPrune {
+			if _, err := stmtArchive.ExecContext(ctx, item.newStability, refTimeStr, item.id); err != nil {
+				return 0, 0, 0, 0, fmt.Errorf("failed archiving node %s in scoped decay: %w", item.id, err)
+			}
+			archived++
+		} else {
+			if _, err := stmtUpdate.ExecContext(ctx, item.newStability, item.id); err != nil {
+				return 0, 0, 0, 0, fmt.Errorf("failed updating node %s in scoped decay: %w", item.id, err)
+			}
+			decayed++
+		}
+	}
+
+	// 3. Prune edges incident to soft-archived nodes
+	edgeRes, err := tx.ExecContext(ctx, `
+		DELETE FROM edges
+		WHERE weight < ?
+		   OR source_id IN (SELECT id FROM nodes WHERE is_archived = 1)
+		   OR target_id IN (SELECT id FROM nodes WHERE is_archived = 1)
+	`, 0.05)
+	if err == nil {
+		if count, err := edgeRes.RowsAffected(); err == nil {
+			prunedEdges = int(count)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, 0, 0, 0, fmt.Errorf("failed committing scoped decay transaction: %w", err)
+	}
+
+	return decayed, archived, prunedEdges, protected, nil
 }
 
 // GetConsolidationStats calculates telemetry metrics for active vs soft-archived traces and graph growth.
