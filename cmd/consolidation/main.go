@@ -167,7 +167,7 @@ func main() {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("[Sekha Consolidation Daemon] Listening on http://0.0.0.0:%d", *port)
+		log.Printf("[Sekha Consolidation Daemon] Listening on port %d", *port)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("[FATAL] HTTP server encountered failure: %v", err)
 		}

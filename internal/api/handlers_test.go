@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Duara-Cortex/sekha-knowledge-store/internal/embedding"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/model"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/recall"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/store"
@@ -1035,3 +1036,155 @@ func TestRecall_PayloadSizeBenchmark(t *testing.T) {
 		t.Fatalf("expected stripped payload to be < 2 KB, got %.2f KB", avgStrippedKB)
 	}
 }
+
+func TestAPIHealth_EmbeddingEngineTelemetry(t *testing.T) {
+	ctx := context.Background()
+	ms := newAPIMockStore()
+
+	// 1. Standalone mode (no environment configuration, embedding disabled)
+	engine, err := recall.NewEngine(ctx, ms, recall.DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed creating engine: %v", err)
+	}
+
+	server := NewServer(ms, engine, 8084)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/memory/health", nil)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rec.Code)
+	}
+
+	var health model.HealthResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &health); err != nil {
+		t.Fatalf("failed unmarshaling health response: %v", err)
+	}
+
+	if health.EmbeddingEngine == nil {
+		t.Fatalf("expected embedding_engine field in health response, but got nil")
+	}
+
+	if health.EmbeddingEngine.Enabled {
+		t.Fatalf("expected embedding_engine.enabled = false in standalone mode")
+	}
+	if health.EmbeddingEngine.Status != "offline" {
+		t.Fatalf("expected embedding_engine.status = offline, got %s", health.EmbeddingEngine.Status)
+	}
+
+	// 2. Enabled mode (configured with embedder)
+	mockEmb := embedding.NewMockEmbedder(384)
+	server.SetEmbedder(mockEmb)
+
+	rec2 := httptest.NewRecorder()
+	server.ServeHTTP(rec2, req)
+	if err := json.Unmarshal(rec2.Body.Bytes(), &health); err != nil {
+		t.Fatalf("failed unmarshaling health response: %v", err)
+	}
+
+	if !health.EmbeddingEngine.Enabled {
+		t.Fatalf("expected embedding_engine.enabled = true when configured")
+	}
+	if health.EmbeddingEngine.Dimension != 384 {
+		t.Fatalf("expected embedding dimension 384, got %d", health.EmbeddingEngine.Dimension)
+	}
+	if health.EmbeddingEngine.Status != "reachable" {
+		t.Fatalf("expected embedding_engine.status = reachable, got %s", health.EmbeddingEngine.Status)
+	}
+	t.Logf("Embedding telemetry: %+v", *health.EmbeddingEngine)
+}
+
+func TestAPIInsert_OnTheFlyDenseEmbedding(t *testing.T) {
+	ctx := context.Background()
+	ms := newAPIMockStore()
+	engine, err := recall.NewEngine(ctx, ms, recall.DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed creating engine: %v", err)
+	}
+
+	server := NewServer(ms, engine, 8084)
+
+	// Insert node with OMITTED embedding
+	nodeWithoutEmb := model.Node{
+		ID:         "node-no-emb",
+		EntityType: "concept",
+		Label:      "Edge Embedding Engine",
+		Summary:    "all-MiniLM-L6-v2 384-dimensional dense semantic vectors",
+	}
+
+	body, _ := json.Marshal(model.InsertRequest{
+		Nodes: []model.Node{nodeWithoutEmb},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/memory/insert", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Verify node in store received computed 384-D embedding
+	storedNode, err := ms.GetNode(ctx, "node-no-emb")
+	if err != nil || storedNode == nil {
+		t.Fatalf("expected stored node, got error: %v", err)
+	}
+
+	if len(storedNode.Embedding) != 384 {
+		t.Fatalf("expected 384-D dense embedding to be computed on-the-fly, got %d", len(storedNode.Embedding))
+	}
+}
+
+func TestAPIRecall_HybridParameters(t *testing.T) {
+	ctx := context.Background()
+	ms := newAPIMockStore()
+	now := time.Now().UTC()
+
+	node := model.Node{
+		ID:             "hybrid-api-node",
+		EntityType:     "concept",
+		Label:          "Consensus Cluster Coordination",
+		Summary:        "heartbeat timeout configured to 500ms",
+		CreatedAt:      now,
+		LastAccessedAt: now,
+		AccessCount:    1,
+		StabilityScore: 1.0,
+	}
+	_, _ = ms.InsertNodes(ctx, []model.Node{node})
+
+	engine, err := recall.NewEngine(ctx, ms, recall.DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed creating engine: %v", err)
+	}
+
+	server := NewServer(ms, engine, 8084)
+
+	// Test URL query parameter overrides: ?hybrid_alpha=0.90&mode=dense
+	body, _ := json.Marshal(model.RecallRequest{
+		Query: "consensus heartbeat",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/memory/recall?hybrid_alpha=0.90&mode=dense", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp model.RecallResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed unmarshaling recall response: %v", err)
+	}
+
+	if len(resp.Nodes) == 0 {
+		t.Fatalf("expected recall results")
+	}
+
+	// In dense mode, sim_score should equal dense_score
+	node0 := resp.Nodes[0]
+	if node0.DenseScore == nil || math.Abs(node0.SimScore-*node0.DenseScore) > 1e-4 {
+		t.Fatalf("expected sim_score (%f) to equal dense_score (%v)", node0.SimScore, node0.DenseScore)
+	}
+}
+

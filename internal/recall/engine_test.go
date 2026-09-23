@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 
 // mockStore provides an in-memory Store for unit testing the recall engine.
 type mockStore struct {
+	mu      sync.RWMutex
 	nodes   map[string]model.Node
 	edges   []model.Edge
 	headers []store.NodeHeader
@@ -28,7 +30,7 @@ func newMockStore() *mockStore {
 
 func (m *mockStore) Close() error { return nil }
 
-func (m *mockStore) AttachAnchors(ctx context.Context, nodeID string, anchors []string) error {
+func (m *mockStore) attachAnchorsLocked(nodeID string, anchors []string) {
 	seen := make(map[string]struct{})
 	for _, existing := range m.anchors[nodeID] {
 		seen[existing] = struct{}{}
@@ -46,14 +48,26 @@ func (m *mockStore) AttachAnchors(ctx context.Context, nodeID string, anchors []
 		n.Anchors = m.anchors[nodeID]
 		m.nodes[nodeID] = n
 	}
+}
+
+func (m *mockStore) AttachAnchors(ctx context.Context, nodeID string, anchors []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.attachAnchorsLocked(nodeID, anchors)
 	return nil
 }
 
 func (m *mockStore) GetAnchorsForNode(ctx context.Context, nodeID string) ([]string, error) {
-	return m.anchors[nodeID], nil
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	res := make([]string, len(m.anchors[nodeID]))
+	copy(res, m.anchors[nodeID])
+	return res, nil
 }
 
 func (m *mockStore) GetNodeIDsForAnchors(ctx context.Context, anchors []string) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	var res []string
 	seen := make(map[string]struct{})
 	target := make(map[string]struct{})
@@ -78,9 +92,11 @@ func (m *mockStore) GetNodeIDsForAnchors(ctx context.Context, anchors []string) 
 }
 
 func (m *mockStore) InsertNodes(ctx context.Context, nodes []model.Node) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for _, n := range nodes {
 		if len(n.Anchors) > 0 {
-			_ = m.AttachAnchors(ctx, n.ID, n.Anchors)
+			m.attachAnchorsLocked(n.ID, n.Anchors)
 			n.Anchors = m.anchors[n.ID]
 		}
 		m.nodes[n.ID] = n
@@ -109,11 +125,15 @@ func (m *mockStore) InsertNodes(ctx context.Context, nodes []model.Node) (int, e
 }
 
 func (m *mockStore) InsertEdges(ctx context.Context, edges []model.Edge) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.edges = append(m.edges, edges...)
 	return len(edges), nil
 }
 
 func (m *mockStore) GetNode(ctx context.Context, id string) (*model.Node, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	n, exists := m.nodes[id]
 	if !exists {
 		return nil, nil
@@ -123,6 +143,8 @@ func (m *mockStore) GetNode(ctx context.Context, id string) (*model.Node, error)
 }
 
 func (m *mockStore) GetNodes(ctx context.Context, ids []string) (map[string]model.Node, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	res := make(map[string]model.Node)
 	for _, id := range ids {
 		if n, ok := m.nodes[id]; ok {
@@ -134,10 +156,16 @@ func (m *mockStore) GetNodes(ctx context.Context, ids []string) (map[string]mode
 }
 
 func (m *mockStore) GetAllNodeHeaders(ctx context.Context) ([]store.NodeHeader, error) {
-	return m.headers, nil
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	res := make([]store.NodeHeader, len(m.headers))
+	copy(res, m.headers)
+	return res, nil
 }
 
 func (m *mockStore) GetEdgesForNodes(ctx context.Context, nodeIDs []string) ([]model.Edge, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	set := make(map[string]bool)
 	for _, id := range nodeIDs {
 		set[id] = true
@@ -152,6 +180,8 @@ func (m *mockStore) GetEdgesForNodes(ctx context.Context, nodeIDs []string) ([]m
 }
 
 func (m *mockStore) RecordAccess(ctx context.Context, nodeIDs []string, accessTime time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for _, id := range nodeIDs {
 		if n, ok := m.nodes[id]; ok {
 			n.AccessCount++
@@ -163,10 +193,14 @@ func (m *mockStore) RecordAccess(ctx context.Context, nodeIDs []string, accessTi
 }
 
 func (m *mockStore) GetCounts(ctx context.Context) (int64, int64, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return int64(len(m.nodes)), int64(len(m.edges)), nil
 }
 
 func (m *mockStore) GetGraphSummary(ctx context.Context) (*model.GraphSummary, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return &model.GraphSummary{
 		NodeCount: int64(len(m.nodes)),
 		EdgeCount: int64(len(m.edges)),
@@ -174,6 +208,8 @@ func (m *mockStore) GetGraphSummary(ctx context.Context) (*model.GraphSummary, e
 }
 
 func (m *mockStore) FindMatchingNode(ctx context.Context, label string, entityType string) (*model.Node, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	for _, n := range m.nodes {
 		if n.Label == label {
 			return &n, nil
@@ -803,3 +839,290 @@ func TestRecallEngine_AnchorsOmittedRegression(t *testing.T) {
 			resp.Nodes[0].AnchorScore, resp.Nodes[1].AnchorScore)
 	}
 }
+
+func TestRecallEngine_AcceptanceCriterion1_SemanticParaphrasing(t *testing.T) {
+	ctx := context.Background()
+	ms := newMockStore()
+	now := time.Now().UTC()
+
+	// Target node using technical terminology "consensus heartbeat timeout"
+	targetNode := model.Node{
+		ID:             "target-consensus-heartbeat",
+		EntityType:     "decision",
+		Label:          "Consensus Cluster Configuration",
+		Summary:        "consensus heartbeat timeout configured to 500ms for node health monitoring",
+		CreatedAt:      now.Add(-48 * time.Hour),
+		LastAccessedAt: now.Add(-48 * time.Hour),
+		AccessCount:    2,
+		StabilityScore: 1.0,
+	}
+
+	// Multiple recent distractor nodes
+	distractors := []model.Node{
+		{
+			ID:             "distractor-database",
+			EntityType:     "concept",
+			Label:          "Database WAL Maintenance",
+			Summary:        "sqlite checkpoint routine and journal mode settings",
+			CreatedAt:      now.Add(-5 * time.Minute),
+			LastAccessedAt: now.Add(-5 * time.Minute),
+			AccessCount:    25,
+			StabilityScore: 1.0,
+		},
+		{
+			ID:             "distractor-thermal",
+			EntityType:     "telemetry",
+			Label:          "Cryogenic Refrigerator Sensor",
+			Summary:        "thermal sensor telemetry logging threshold alarms",
+			CreatedAt:      now.Add(-1 * time.Minute),
+			LastAccessedAt: now.Add(-1 * time.Minute),
+			AccessCount:    40,
+			StabilityScore: 1.0,
+		},
+	}
+
+	allNodes := append([]model.Node{targetNode}, distractors...)
+	_, _ = ms.InsertNodes(ctx, allNodes)
+
+	engine, err := NewEngine(ctx, ms, DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	// Conceptual paraphrase query: "cluster coordination interval"
+	req := model.RecallRequest{
+		Query: "cluster coordination interval",
+		TopK:  3,
+		Alpha: 0.6,
+		Beta:  0.2,
+		Gamma: 0.2,
+	}
+
+	resp, err := engine.Recall(ctx, req)
+	if err != nil {
+		t.Fatalf("recall failed: %v", err)
+	}
+
+	if len(resp.Nodes) == 0 {
+		t.Fatalf("expected results, got 0")
+	}
+
+	rank1 := resp.Nodes[0]
+	t.Logf("Rank 1: %s (Score: %f, Sim: %f, Dense: %v, BM25: %v)",
+		rank1.ID, rank1.Score, rank1.SimScore, rank1.DenseScore, rank1.BM25Score)
+
+	// Verification 1: Target node ranks #1
+	if rank1.ID != "target-consensus-heartbeat" {
+		t.Fatalf("expected target-consensus-heartbeat at Rank 1, got %s", rank1.ID)
+	}
+
+	// Verification 2: Dense cosine similarity > 0.70
+	if rank1.DenseScore == nil || *rank1.DenseScore <= 0.70 {
+		t.Fatalf("expected S_dense > 0.70 for conceptual paraphrase, got %v", rank1.DenseScore)
+	}
+}
+
+func TestRecallEngine_AcceptanceCriterion2_LexicalKeywordFidelity(t *testing.T) {
+	ctx := context.Background()
+	ms := newMockStore()
+	now := time.Now().UTC()
+
+	// Target 1: contains exact technical token "worker_connections 4096"
+	targetNginx := model.Node{
+		ID:             "nginx-worker-connections",
+		EntityType:     "procedure",
+		Label:          "Web Gateway High Concurrency Tuning",
+		Summary:        "Set worker_connections 4096 in nginx core events block for web tier",
+		CreatedAt:      now.Add(-72 * time.Hour),
+		LastAccessedAt: now.Add(-72 * time.Hour),
+		AccessCount:    3,
+		StabilityScore: 1.0,
+	}
+
+	// Target 2: contains exact technical token "port 8084"
+	targetPort := model.Node{
+		ID:             "service-port-8084",
+		EntityType:     "decision",
+		Label:          "Service Port Bindings",
+		Summary:        "Sekha knowledge graph API listening on port 8084",
+		CreatedAt:      now.Add(-48 * time.Hour),
+		LastAccessedAt: now.Add(-48 * time.Hour),
+		AccessCount:    2,
+		StabilityScore: 1.0,
+	}
+
+	// Frequent distractor nodes
+	distractor := model.Node{
+		ID:             "distractor-common",
+		EntityType:     "concept",
+		Label:          "General High Concurrency Overview",
+		Summary:        "Overview of high concurrency architecture and web tier gateway load",
+		CreatedAt:      now.Add(-2 * time.Minute),
+		LastAccessedAt: now.Add(-2 * time.Minute),
+		AccessCount:    100,
+		StabilityScore: 1.0,
+	}
+
+	_, _ = ms.InsertNodes(ctx, []model.Node{targetNginx, targetPort, distractor})
+
+	engine, err := NewEngine(ctx, ms, DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	// Query 1: Exact technical tokens "worker_connections 4096" phrased differently
+	req1 := model.RecallRequest{
+		Query: "tuning parameters for worker_connections 4096",
+		TopK:  3,
+	}
+	resp1, err := engine.Recall(ctx, req1)
+	if err != nil {
+		t.Fatalf("recall query 1 failed: %v", err)
+	}
+
+	if len(resp1.Nodes) == 0 {
+		t.Fatalf("query 1 returned 0 nodes")
+	}
+	if resp1.Nodes[0].ID != "nginx-worker-connections" {
+		t.Fatalf("expected nginx-worker-connections at rank 1 via BM25 keyword boost, got %s", resp1.Nodes[0].ID)
+	}
+	if resp1.Nodes[0].BM25Score == nil || *resp1.Nodes[0].BM25Score <= 0.3 {
+		t.Fatalf("expected high BM25 boost for exact technical tokens, got %v", resp1.Nodes[0].BM25Score)
+	}
+
+	// Query 2: Technical token "port 8084"
+	req2 := model.RecallRequest{
+		Query: "knowledge store port 8084",
+		TopK:  3,
+	}
+	resp2, err := engine.Recall(ctx, req2)
+	if err != nil {
+		t.Fatalf("recall query 2 failed: %v", err)
+	}
+	if len(resp2.Nodes) == 0 || resp2.Nodes[0].ID != "service-port-8084" {
+		t.Fatalf("expected service-port-8084 at rank 1, got %v", resp2.Nodes)
+	}
+}
+
+func TestRecallEngine_AcceptanceCriterion3_NoiseSuppression(t *testing.T) {
+	ctx := context.Background()
+	ms := newMockStore()
+	now := time.Now().UTC()
+
+	unrelatedNodes := []model.Node{
+		{
+			ID:             "node-nginx",
+			EntityType:     "concept",
+			Label:          "Nginx Worker Settings",
+			Summary:        "worker_connections 4096 tuned for high concurrent throughput",
+			CreatedAt:      now,
+			LastAccessedAt: now,
+			AccessCount:    10,
+			StabilityScore: 1.0,
+		},
+		{
+			ID:             "node-thermal",
+			EntityType:     "telemetry",
+			Label:          "Cryogenic Refrigerator Telemetry",
+			Summary:        "temperature sensor threshold alert on node-3",
+			CreatedAt:      now,
+			LastAccessedAt: now,
+			AccessCount:    5,
+			StabilityScore: 1.0,
+		},
+	}
+
+	_, _ = ms.InsertNodes(ctx, unrelatedNodes)
+
+	engine, err := NewEngine(ctx, ms, DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	// Synthetic out-of-vocabulary project query: "Petrelwick deployment"
+	req := model.RecallRequest{
+		Query: "Petrelwick deployment",
+		TopK:  2,
+	}
+
+	resp, err := engine.Recall(ctx, req)
+	if err != nil {
+		t.Fatalf("recall failed: %v", err)
+	}
+
+	for _, n := range resp.Nodes {
+		t.Logf("Node %s sim_score = %f (Dense: %v, BM25: %v)", n.ID, n.SimScore, n.DenseScore, n.BM25Score)
+		// Acceptance Criterion 3: similarity score < 0.10
+		if n.SimScore >= 0.10 {
+			t.Fatalf("Acceptance Criterion 3 Failed: expected sim_score < 0.10, got %f for %s", n.SimScore, n.ID)
+		}
+		if n.DenseScore != nil && *n.DenseScore >= 0.10 {
+			t.Fatalf("expected dense similarity < 0.10, got %f for %s", *n.DenseScore, n.ID)
+		}
+	}
+}
+
+func TestRecallEngine_HybridModesAndAlpha(t *testing.T) {
+	ctx := context.Background()
+	ms := newMockStore()
+	now := time.Now().UTC()
+
+	node := model.Node{
+		ID:             "hybrid-test-node",
+		EntityType:     "concept",
+		Label:          "Cluster Consensus Heartbeat",
+		Summary:        "consensus heartbeat timeout configured to 500ms for node health",
+		CreatedAt:      now,
+		LastAccessedAt: now,
+		AccessCount:    1,
+		StabilityScore: 1.0,
+	}
+
+	_, _ = ms.InsertNodes(ctx, []model.Node{node})
+
+	engine, err := NewEngine(ctx, ms, DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	query := "cluster coordination interval"
+
+	// 1. Pure Dense Mode
+	respDense, err := engine.Recall(ctx, model.RecallRequest{
+		Query: query,
+		Mode:  "dense",
+	})
+	if err != nil {
+		t.Fatalf("recall dense failed: %v", err)
+	}
+	if math.Abs(respDense.Nodes[0].SimScore-*respDense.Nodes[0].DenseScore) > 1e-4 {
+		t.Fatalf("in dense mode, sim_score must equal dense_score")
+	}
+
+	// 2. Pure BM25 Mode
+	respBM25, err := engine.Recall(ctx, model.RecallRequest{
+		Query: query,
+		Mode:  "bm25",
+	})
+	if err != nil {
+		t.Fatalf("recall bm25 failed: %v", err)
+	}
+	if math.Abs(respBM25.Nodes[0].SimScore-*respBM25.Nodes[0].BM25Score) > 1e-4 {
+		t.Fatalf("in bm25 mode, sim_score must equal bm25_score")
+	}
+
+	// 3. Custom Hybrid Alpha = 0.80
+	alpha80 := 0.80
+	respCustom, err := engine.Recall(ctx, model.RecallRequest{
+		Query:       query,
+		HybridAlpha: &alpha80,
+	})
+	if err != nil {
+		t.Fatalf("recall custom failed: %v", err)
+	}
+	expectedSim := 0.80*(*respCustom.Nodes[0].DenseScore) + 0.20*(*respCustom.Nodes[0].BM25Score)
+	if math.Abs(respCustom.Nodes[0].SimScore-math.Round(expectedSim*10000)/10000) > 1e-3 {
+		t.Fatalf("expected sim_score %.4f, got %.4f", expectedSim, respCustom.Nodes[0].SimScore)
+	}
+}
+

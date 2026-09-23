@@ -9,6 +9,7 @@ Type=simple
 User=admin
 Group=admin
 WorkingDirectory=/home/admin
+EnvironmentFile=-/etc/default/sekha
 ExecStart=/usr/local/bin/sekha-knowledge-store -port 8084 -db /var/lib/sekha/knowledge.db -alpha 0.6 -beta 0.2 -gamma 0.2 -tau 24h
 Restart=always
 RestartSec=3

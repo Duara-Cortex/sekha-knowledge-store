@@ -106,71 +106,19 @@ func extractStem(word string) string {
 	return stem
 }
 
+var defaultMock = NewMockEmbedder(384)
+
 // Generate synthesises a deterministic, unit-normalised float32 vector
-// from input text using token, stem, and subword n-gram feature projections.
-// Unlike whole-string SHA-256 projections, texts with overlapping words and
-// concepts yield high cosine similarity, while unrelated texts yield near-zero similarity.
+// from input text using concept-aware semantic projections and token feature hashing.
 func Generate(text string, dims int) []float32 {
 	if dims <= 0 {
-		dims = 64
+		dims = 384
 	}
-
-	vec := make([]float32, dims)
-	tokens := ExtractTokens(text)
-	if len(tokens) == 0 {
-		// Fallback for empty or purely stopword input
-		raw := strings.ToLower(strings.TrimSpace(text))
-		if raw != "" {
-			projectToken(raw, dims, 1.0, vec)
-		} else {
-			return vec
-		}
+	if dims == 384 {
+		return defaultMock.generate(text)
 	}
-
-	for i, token := range tokens {
-		// 1. Morphological Stem Projection (primary semantic root anchor)
-		stem := extractStem(token)
-		wordWeight := float32(1.0 + 0.15*math.Min(5.0, float64(len(token))))
-		projectToken("s:"+stem, dims, wordWeight*1.2, vec)
-
-		// 2. Primary Word Token Projection (distinguishes exact surface form)
-		projectToken("w:"+token, dims, wordWeight*0.7, vec)
-
-		// 3. Subword character 3-grams and 4-grams (captures subword similarities)
-		runes := []rune(token)
-		if len(runes) >= 3 {
-			for j := 0; j <= len(runes)-3; j++ {
-				ngram := string(runes[j : j+3])
-				projectToken("ng3:"+ngram, dims, 0.40, vec)
-			}
-		}
-		if len(runes) >= 4 {
-			for j := 0; j <= len(runes)-4; j++ {
-				ngram := string(runes[j : j+4])
-				projectToken("ng4:"+ngram, dims, 0.35, vec)
-			}
-		}
-
-		// 4. Adjacent word bigrams (captures local phrase semantics)
-		if i+1 < len(tokens) {
-			bigram := token + "_" + tokens[i+1]
-			projectToken("bi:"+bigram, dims, 0.5, vec)
-		}
-	}
-
-	// Normalise to unit Euclidean length
-	var sum float64
-	for _, v := range vec {
-		sum += float64(v * v)
-	}
-	mag := float32(math.Sqrt(sum))
-	if mag > 0 {
-		for i := range vec {
-			vec[i] /= mag
-		}
-	}
-
-	return vec
+	mock := NewMockEmbedder(dims)
+	return mock.generate(text)
 }
 
 // CosineSimilarity calculates the dot product between two normalised float32 vectors,

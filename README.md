@@ -3,7 +3,7 @@
 **Persistent Relational Knowledge Graph, Associative Retrieval & Memory Consolidation Subsystem for Node 1**  
 *Part of the Sekha Tri-Node Edge Cognitive Cluster &bull; Duara Cortex Q3 2026*
 
-`sekha-knowledge-store` is a local-first, low-latency persistent knowledge graph and memory consolidation subsystem engineered in pure Go (with zero CGO dependencies) running on **Node 1** (`sekha-node1` &bull; `192.168.8.213` &bull; 8GB RAM). It acts as the Long-Term Memory (LTM) subsystem of the Sekha cognitive cluster, executing low-latency associative recall alongside background memory consolidation and mathematical recency decay.
+`sekha-knowledge-store` is a local-first, low-latency persistent knowledge graph and memory consolidation subsystem engineered in pure Go (with zero CGO dependencies) running on **Node 1** (`sekha-node1` &bull; 8GB RAM ARM64). It acts as the Long-Term Memory (LTM) subsystem of the Sekha cognitive cluster, executing low-latency associative recall alongside background memory consolidation and mathematical recency decay.
 
 ---
 
@@ -127,7 +127,7 @@ make validate
 make validate-consolidation
 ```
 
-### On Node 1 (`sekha-node1` &bull; `192.168.8.213`):
+### On Target Node:
 ```bash
 # Clone repository
 git clone git@github.com:Duara-Cortex/sekha-knowledge-store.git
@@ -140,3 +140,88 @@ sudo make install
 # Check status via native CLI
 sekha status
 ```
+
+---
+
+## Configuration & Environment
+
+The knowledge store supports optional dense semantic embeddings combined with in-memory lexical BM25 search. Configuration is loaded from environment variables, `/etc/default/sekha` (systemd on Linux), or a local `.env` file (Windows / macOS).
+
+### Hardware Considerations: Edge Defaults vs. High-Performance Hardware
+
+`sekha-knowledge-store` was engineered and benchmarked for resource-constrained edge hardware (such as a **Raspberry Pi 5 ARM64 with 8GB RAM**):
+- **Edge Defaults:** Tuned for low memory and CPU constraints. By default, it uses compact 384-D dense embeddings (`all-MiniLM-L6-v2`) taking only ~15 MB of RAM per 10,000 nodes, achieving sub-15ms associative recall purely on CPU without GPU acceleration.
+- **Scaling for High-Performance Hardware:** If you are running on more capable hardware (multi-core desktop CPUs, high-RAM workstations, or servers with dedicated GPUs):
+  - **Higher-Dimensional Embeddings:** You are not restricted to 384-D vectors. You can plug in higher-dimensional models (such as 768-D or 1024-D embeddings like `bge-large`, `nomic-embed-text`, or `text-embedding-3-small`) simply by setting `SEKHA_EMBEDDING_DIM` and updating `SEKHA_EMBEDDING_URL`.
+  - **Large-Scale Knowledge Graphs:** Memory consumption scales linearly (~1.5 KB per 384-D node). A workstation or server with 16GB–64GB RAM can host millions of nodes entirely in-memory with sub-10ms recall.
+  - **Sub-Millisecond Query Latencies:** Systems with wide SIMD vector pipelines (AVX2, AVX-512, or Apple Silicon NEON) execute linear dot product scans in `< 1.0ms`.
+  - **Adjustable Timeouts:** You can tune `SEKHA_EMBEDDING_TIMEOUT_MS` based on whether your embedding model runs locally on a fast GPU or over a network.
+
+### Linux Deployment (`/etc/default/sekha`)
+
+On Linux/systemd nodes, create or edit `/etc/default/sekha` directly:
+
+```bash
+sudo nano /etc/default/sekha
+```
+
+Add your environment configuration:
+
+```bash
+# =====================================================================
+# Sekha Knowledge Store Configuration
+# Location: /etc/default/sekha (or .env in project root)
+# =====================================================================
+
+# Enable the dense embedding engine (set to true to connect to service)
+SEKHA_EMBEDDING_ENABLED=true
+
+# Full URL to your OpenAI-compatible /v1/embeddings endpoint
+# Replace <embedding-host> and <port> with your embedding service host/IP and configured port
+SEKHA_EMBEDDING_URL=http://<embedding-host>:<port>/v1/embeddings
+
+# Vector dimension (384 for all-MiniLM-L6-v2, or higher if using larger models)
+SEKHA_EMBEDDING_DIM=384
+
+# Request timeout in milliseconds
+SEKHA_EMBEDDING_TIMEOUT_MS=500
+```
+
+After modifying `/etc/default/sekha`, restart the service to apply changes:
+```bash
+sudo systemctl restart sekha-knowledge-store
+```
+
+### Windows & macOS Environments (`.env`)
+
+Because Windows does not have an `/etc` directory and does not use `systemd`, **Windows users must use a `.env` file** in the project root instead of `/etc/default/sekha`.
+
+1. Create a `.env` file in the root of the repository:
+   ```bash
+   SEKHA_EMBEDDING_ENABLED=true
+   SEKHA_EMBEDDING_URL=http://<embedding-host>:<port>/v1/embeddings
+   SEKHA_EMBEDDING_DIM=384
+   SEKHA_EMBEDDING_TIMEOUT_MS=500
+   ```
+
+2. The application automatically detects and loads `.env` upon startup on Windows and macOS:
+   ```powershell
+   # PowerShell (Windows)
+   .\bin\sekha-knowledge-store.exe -port <port> -db knowledge.db
+   ```
+   Or set environment variables directly in your shell session:
+   ```powershell
+   $env:SEKHA_EMBEDDING_ENABLED="true"
+   $env:SEKHA_EMBEDDING_URL="http://<embedding-host>:<port>/v1/embeddings"
+   ```
+
+### Standalone Mode (Zero External Dependencies)
+
+If no environment configuration exists (or if `SEKHA_EMBEDDING_ENABLED=false`), the subsystem automatically sets itself up in **standalone mode**:
+- Operates with pure in-memory lexical BM25 search and local deterministic projections.
+- Requires no external embedding service or network connectivity.
+- `make install` will never force-create `/etc/default/sekha`, and will preserve your existing file if one is already present on the node.
+
+
+
+

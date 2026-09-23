@@ -33,7 +33,7 @@ type Extractor struct {
 // NewExtractor initialises a trace extractor producing deterministic normalised embeddings.
 func NewExtractor(vectorDims int) *Extractor {
 	if vectorDims <= 0 {
-		vectorDims = 64
+		vectorDims = model.DefaultVectorDim
 	}
 	return &Extractor{vectorDims: vectorDims}
 }

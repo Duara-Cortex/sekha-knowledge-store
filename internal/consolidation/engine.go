@@ -50,7 +50,7 @@ func (e *Engine) notifyNodeListeners(nodes []model.Node) {
 
 // NewEngine initialises the consolidation engine with SQLite storage and decay parameters.
 func NewEngine(s store.Store, cfg model.DecayConfig) *Engine {
-	extractor := NewExtractor(64)
+	extractor := NewExtractor(model.DefaultVectorDim)
 	fusion := NewFusionEngine(s, cfg)
 
 	return &Engine{
