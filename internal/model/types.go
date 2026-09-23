@@ -26,6 +26,7 @@ type Node struct {
 	ArchivedAt       *time.Time `json:"archived_at,omitempty"`
 	AccessCount      int64      `json:"access_count"`
 	StabilityScore   float64    `json:"stability_score"`
+	ImportanceScore  float64    `json:"importance_score"`
 	IsArchived       bool       `json:"is_archived"`
 }
 
@@ -55,14 +56,15 @@ type Edge struct {
 // ScoredNode wraps a Node with the associative recall score breakdown.
 type ScoredNode struct {
 	Node
-	Score          float64  `json:"score"`
-	SimScore       float64  `json:"sim_score"`
-	DenseScore     *float64 `json:"dense_score,omitempty"`
-	BM25Score      *float64 `json:"bm25_score,omitempty"`
-	FrequencyScore float64  `json:"frequency_score"`
-	RecencyScore   float64  `json:"recency_score"`
-	AnchorScore    float64  `json:"anchor_score,omitempty"`
-	HopDistance    int      `json:"hop_distance"`
+	Score           float64  `json:"score"`
+	SimScore        float64  `json:"sim_score"`
+	DenseScore      *float64 `json:"dense_score,omitempty"`
+	BM25Score       *float64 `json:"bm25_score,omitempty"`
+	FrequencyScore  float64  `json:"frequency_score"`
+	RecencyScore    float64  `json:"recency_score"`
+	ImportanceScore float64  `json:"importance_score"`
+	AnchorScore     float64  `json:"anchor_score,omitempty"`
+	HopDistance     int      `json:"hop_distance"`
 }
 
 // MarshalJSON customises JSON serialisation for ScoredNode using ScoredNodeDTO to omit nil embeddings and prune schemas.
@@ -96,6 +98,7 @@ type ScoredNodeDTO struct {
 	ArchivedAt       *time.Time `json:"archived_at,omitempty"`
 	AccessCount      *int64     `json:"access_count,omitempty"`
 	StabilityScore   *float64   `json:"stability_score,omitempty"`
+	ImportanceScore  *float64   `json:"importance_score,omitempty"`
 	IsArchived       *bool      `json:"is_archived,omitempty"`
 	SimScore         *float64   `json:"sim_score,omitempty"`
 	DenseScore       *float64   `json:"dense_score,omitempty"`
@@ -145,6 +148,11 @@ func (sn ScoredNode) ToDTO(includeEmbeddings bool) ScoredNodeDTO {
 	}
 	if sn.AnchorScore > 0 {
 		dto.AnchorScore = &sn.AnchorScore
+	}
+	if sn.ImportanceScore > 0 {
+		dto.ImportanceScore = &sn.ImportanceScore
+	} else if sn.Node.ImportanceScore > 0 {
+		dto.ImportanceScore = &sn.Node.ImportanceScore
 	}
 	if sn.HopDistance > 0 {
 		dto.HopDistance = &sn.HopDistance
@@ -214,6 +222,12 @@ func (sn ScoredNode) Project(fields []string) map[string]any {
 			out["frequency_score"] = sn.FrequencyScore
 		case "recency_score":
 			out["recency_score"] = sn.RecencyScore
+		case "importance_score":
+			if sn.ImportanceScore > 0 {
+				out["importance_score"] = sn.ImportanceScore
+			} else {
+				out["importance_score"] = sn.Node.ImportanceScore
+			}
 		case "anchor_score":
 			out["anchor_score"] = sn.AnchorScore
 		case "hop_distance":
@@ -243,19 +257,20 @@ type RecallRequest struct {
 	Embedding         []float32 `json:"embedding,omitempty"`
 	EntityID          string    `json:"entity_id,omitempty"`
 	TopK              int       `json:"top_k,omitempty"`
-	Alpha             float64   `json:"alpha,omitempty"`         // Weight for semantic similarity (default 0.6)
-	Beta              float64   `json:"beta,omitempty"`          // Weight for access count frequency (default 0.2)
-	Gamma             float64   `json:"gamma,omitempty"`         // Weight for recency decay (default 0.2)
-	HybridAlpha       *float64  `json:"hybrid_alpha,omitempty"`  // Balance between dense semantic (1.0) and BM25 lexical (0.0), default 0.65
-	Mode              string    `json:"mode,omitempty"`          // "hybrid" | "dense" | "bm25" (default: "hybrid")
-	ExpandNeighbours  *bool     `json:"expand_neighbours,omitempty"` // Explicit toggle (default: false)
-	ExpandHops        int       `json:"expand_hops,omitempty"`       // 0 = direct only, 1 = 1-hop expansion
-	MinEdgeWeight     *float64  `json:"min_edge_weight,omitempty"`   // Minimum edge weight threshold (default: 0.60)
+	Alpha             float64   `json:"alpha,omitempty"`              // Weight for semantic similarity (default 0.50)
+	Beta              float64   `json:"beta,omitempty"`               // Weight for access count frequency (default 0.15)
+	Gamma             float64   `json:"gamma,omitempty"`              // Weight for recency decay (default 0.15)
+	WeightImportance  float64   `json:"weight_importance,omitempty"`  // Weight for intrinsic importance (default 0.20)
+	HybridAlpha       *float64  `json:"hybrid_alpha,omitempty"`       // Balance between dense semantic (1.0) and BM25 lexical (0.0), default 0.65
+	Mode              string    `json:"mode,omitempty"`               // "hybrid" | "dense" | "bm25" (default: "hybrid")
+	ExpandNeighbours  *bool     `json:"expand_neighbours,omitempty"`  // Explicit toggle (default: false)
+	ExpandHops        int       `json:"expand_hops,omitempty"`        // 0 = direct only, 1 = 1-hop expansion
+	MinEdgeWeight     *float64  `json:"min_edge_weight,omitempty"`    // Minimum edge weight threshold (default: 0.60)
 	TraverseRelations []string  `json:"traverse_relations,omitempty"` // Allowed edge relation types (e.g. ["subgoal_of", "depends_on"])
 	AttenuationFactor *float64  `json:"attenuation_factor,omitempty"` // Neighbour score boost multiplier (default: 0.35)
-	Anchors           []string  `json:"anchors,omitempty"`       // Target anchor tags (e.g. ["#project:kestrel"])
-	AnchorMode        string    `json:"anchor_mode,omitempty"`   // "boost" | "filter" (default: "boost")
-	AnchorWeight      float64   `json:"anchor_weight,omitempty"` // Weight for anchor bonus w_anc (default 1.0)
+	Anchors           []string  `json:"anchors,omitempty"`            // Target anchor tags (e.g. ["#project:kestrel"])
+	AnchorMode        string    `json:"anchor_mode,omitempty"`        // "boost" | "filter" (default: "boost")
+	AnchorWeight      float64   `json:"anchor_weight,omitempty"`      // Weight for anchor bonus w_anc (default 1.0)
 	IncludeEmbeddings bool      `json:"include_embeddings,omitempty"`
 	Fields            []string  `json:"fields,omitempty"`
 }

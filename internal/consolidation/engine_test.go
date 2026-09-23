@@ -2,6 +2,7 @@ package consolidation_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -296,5 +297,206 @@ func TestHebbianEdgeWeightReinforcement(t *testing.T) {
 	}
 	if finalWeight > cfg.MaxEdgeWeight {
 		t.Errorf("edge weight exceeded max bound of %f: got %f", cfg.MaxEdgeWeight, finalWeight)
+	}
+}
+
+func TestComputeImportanceHeuristics(t *testing.T) {
+	tests := []struct {
+		name        string
+		entityType  string
+		label       string
+		summary     string
+		anchors     []string
+		minExpected float64
+		maxExpected float64
+	}{
+		{
+			name:        "System Config / Architecture Rule",
+			entityType:  "concept",
+			label:       "Cluster Master Port Config",
+			summary:     "INGEST_PORT binding configurations and cluster network bounds",
+			anchors:     nil,
+			minExpected: 0.85,
+			maxExpected: 1.0,
+		},
+		{
+			name:        "Telemetry Rule / Architecture Guideline",
+			entityType:  "telemetry_rule",
+			label:       "Network Rule",
+			summary:     "Cluster architecture rule",
+			anchors:     nil,
+			minExpected: 0.85,
+			maxExpected: 1.0,
+		},
+		{
+			name:        "Task Goal",
+			entityType:  "task_goal",
+			label:       "Deploy and configure reverse proxy",
+			summary:     "Primary deliberation goal",
+			anchors:     nil,
+			minExpected: 0.85,
+			maxExpected: 1.0,
+		},
+		{
+			name:        "Decision",
+			entityType:  "decision",
+			label:       "Select SQLite for Graph Store",
+			summary:     "Persistence engine selection",
+			anchors:     nil,
+			minExpected: 0.70,
+			maxExpected: 0.85,
+		},
+		{
+			name:        "Procedure",
+			entityType:  "procedure",
+			label:       "Restart Ingest Gateway",
+			summary:     "Service lifecycle step",
+			anchors:     nil,
+			minExpected: 0.70,
+			maxExpected: 0.85,
+		},
+		{
+			name:        "Anchor Boost",
+			entityType:  "concept",
+			label:       "Service Metadata",
+			summary:     "General metadata",
+			anchors:     []string{"#project:kestrel"},
+			minExpected: 0.65, // 0.50 + 0.15
+			maxExpected: 1.0,
+		},
+		{
+			name:        "Sensory / Telemetry Fact",
+			entityType:  "sensory_fact",
+			label:       "Normal CPU thermals",
+			summary:     "Telemetry reading",
+			anchors:     nil,
+			minExpected: 0.40,
+			maxExpected: 0.50,
+		},
+		{
+			name:        "Transient Noise / Jitter",
+			entityType:  "noise",
+			label:       "Transient sensor jitter code_4091",
+			summary:     "Ephemeral noise reading",
+			anchors:     nil,
+			minExpected: 0.20,
+			maxExpected: 0.30,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			score := consolidation.ComputeImportance(tc.entityType, tc.label, tc.summary, tc.anchors)
+			if score < tc.minExpected || score > tc.maxExpected {
+				t.Errorf("ComputeImportance(%s, %s) = %f; expected between %f and %f",
+					tc.entityType, tc.label, score, tc.minExpected, tc.maxExpected)
+			}
+		})
+	}
+}
+
+func TestExecuteScopedDecay(t *testing.T) {
+	s := createTestStore(t, "test_scoped_decay.db")
+	ctx := context.Background()
+	cfg := model.DefaultDecayConfig()
+	engine := consolidation.NewEngine(s, cfg)
+
+	now := time.Now().UTC()
+
+	// Ingest 10 unanchored transient distractor nodes
+	distractors := make([]model.Node, 10)
+	for i := 0; i < 10; i++ {
+		distractors[i] = model.Node{
+			ID:              fmt.Sprintf("distractor-%d", i),
+			EntityType:      "telemetry",
+			Label:           fmt.Sprintf("Transient sensor jitter %d", i),
+			Summary:         "Ephemeral telemetry reading",
+			ImportanceScore: 0.25,
+			StabilityScore:  0.20,
+			CreatedAt:       now.Add(-2 * time.Hour),
+			LastAccessedAt:  now.Add(-2 * time.Hour),
+		}
+	}
+	if _, err := s.InsertNodes(ctx, distractors); err != nil {
+		t.Fatalf("failed inserting distractors: %v", err)
+	}
+
+	// Ingest 2 anchored hub nodes
+	anchoredHubs := []model.Node{
+		{
+			ID:              "hub-1",
+			EntityType:      "concept",
+			Label:           "Cluster Coordinator Hub",
+			Summary:         "Core coordinator entity",
+			Anchors:         []string{"#project:kestrel"},
+			ImportanceScore: 0.40, // Low intrinsic importance, but protected by anchor!
+			StabilityScore:  0.30,
+			CreatedAt:       now.Add(-2 * time.Hour),
+			LastAccessedAt:  now.Add(-2 * time.Hour),
+		},
+	}
+	if _, err := s.InsertNodes(ctx, anchoredHubs); err != nil {
+		t.Fatalf("failed inserting anchored hub: %v", err)
+	}
+
+	// Ingest 2 high importance config nodes
+	criticalConfigs := []model.Node{
+		{
+			ID:              "config-1",
+			EntityType:      "concept",
+			Label:           "INGEST_PORT Config Rule",
+			Summary:         "Ingest port configuration parameter",
+			ImportanceScore: 0.90, // Unanchored, but protected by importance >= 0.80!
+			StabilityScore:  0.30,
+			CreatedAt:       now.Add(-2 * time.Hour),
+			LastAccessedAt:  now.Add(-2 * time.Hour),
+		},
+	}
+	if _, err := s.InsertNodes(ctx, criticalConfigs); err != nil {
+		t.Fatalf("failed inserting critical config: %v", err)
+	}
+
+	// Trigger accelerated decay: scope="unanchored", grace="0s", decayHalfLife="1h"
+	zeroGrace := 0 * time.Second
+	oneHour := 1 * time.Hour
+	pruneThresh := 0.50
+
+	req := model.DecayRequest{
+		Scope:                 "unanchored",
+		InactivityGracePeriod: &zeroGrace,
+		DecayHalfLife:         &oneHour,
+		PruneThreshold:        &pruneThresh,
+		MinImportanceToRetain: 0.80,
+	}
+
+	resp, err := engine.ExecuteScopedDecay(ctx, req, now)
+	if err != nil {
+		t.Fatalf("ExecuteScopedDecay failed: %v", err)
+	}
+
+	if resp.NodesArchived != 10 {
+		t.Errorf("expected 10 distractors archived, got %d", resp.NodesArchived)
+	}
+	if resp.ProtectedNodes < 2 {
+		t.Errorf("expected at least 2 protected nodes, got %d", resp.ProtectedNodes)
+	}
+
+	// Verify all distractors are soft-archived
+	for i := 0; i < 10; i++ {
+		node, err := s.GetNode(ctx, fmt.Sprintf("distractor-%d", i))
+		if err != nil || node == nil || !node.IsArchived {
+			t.Errorf("distractor-%d was not soft-archived", i)
+		}
+	}
+
+	// Verify anchored hub and critical config remain active
+	hub, err := s.GetNode(ctx, "hub-1")
+	if err != nil || hub == nil || hub.IsArchived {
+		t.Errorf("hub-1 was improperly archived")
+	}
+
+	cfgNode, err := s.GetNode(ctx, "config-1")
+	if err != nil || cfgNode == nil || cfgNode.IsArchived {
+		t.Errorf("config-1 was improperly archived")
 	}
 }

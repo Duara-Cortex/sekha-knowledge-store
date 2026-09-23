@@ -9,17 +9,18 @@ import (
 
 // NodeHeader provides lightweight metadata and embedding for in-memory associative indexing.
 type NodeHeader struct {
-	ID             string
-	EntityType     string
-	Label          string
-	Summary        string
-	Embedding      []float32
-	Magnitude      float32
-	LastAccessedAt time.Time
-	AccessCount    int64
-	StabilityScore float64
-	IsArchived     bool
-	Anchors        []string
+	ID              string
+	EntityType      string
+	Label           string
+	Summary         string
+	Embedding       []float32
+	Magnitude       float32
+	LastAccessedAt  time.Time
+	AccessCount     int64
+	StabilityScore  float64
+	ImportanceScore float64
+	IsArchived      bool
+	Anchors         []string
 }
 
 // Store defines persistence operations for the relational knowledge graph.
@@ -29,6 +30,7 @@ type Store interface {
 
 	// Ingestion / Persistence
 	InsertNodes(ctx context.Context, nodes []model.Node) (int, error)
+	UpsertNode(ctx context.Context, node model.Node) error
 	InsertEdges(ctx context.Context, edges []model.Edge) (int, error)
 
 	// Anchors
@@ -40,6 +42,7 @@ type Store interface {
 	GetNode(ctx context.Context, id string) (*model.Node, error)
 	GetNodes(ctx context.Context, ids []string) (map[string]model.Node, error)
 	GetAllNodeHeaders(ctx context.Context) ([]NodeHeader, error)
+	GetAllActiveNodes(ctx context.Context) ([]model.Node, error)
 	GetEdgesForNodes(ctx context.Context, nodeIDs []string) ([]model.Edge, error)
 	FindMatchingNode(ctx context.Context, label string, entityType string) (*model.Node, error)
 
@@ -55,6 +58,7 @@ type Store interface {
 	ReinforceEdge(ctx context.Context, sourceID, targetID, relationType string, deltaW float64, maxWeight float64, reinforcedAt time.Time) (float64, error)
 	BoostNodeStability(ctx context.Context, nodeID string, deltaStability float64, reinforcedAt time.Time) error
 	ApplyDecayAndPrune(ctx context.Context, cfg model.DecayConfig, refTime time.Time) (decayed int, archived int, prunedEdges int, err error)
+	ApplyScopedDecay(ctx context.Context, req model.DecayRequest, refTime time.Time) (decayed int, archived int, prunedEdges int, protected int, err error)
 
 	// Telemetry & Metrics
 	GetGraphSummary(ctx context.Context) (*model.GraphSummary, error)

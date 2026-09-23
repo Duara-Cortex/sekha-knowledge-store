@@ -90,6 +90,24 @@ func main() {
 		_ = json.NewEncoder(w).Encode(res)
 	})
 
+	mux.HandleFunc("POST /api/v1/consolidation/decay", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		var req model.DecayRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON payload: " + err.Error()})
+			return
+		}
+		res, err := engine.ExecuteScopedDecay(r.Context(), req, time.Now().UTC())
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(res)
+	})
+
 	mux.HandleFunc("POST /api/v1/memory/consolidate", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		var req model.ConsolidateRequest

@@ -216,6 +216,50 @@ func (e *Engine) RunConsolidationCycle(ctx context.Context, refTime time.Time) (
 	}, nil
 }
 
+// ExecuteScopedDecay performs on-demand, session-scoped accelerated decay and immediate pruning of unanchored distractor traces.
+func (e *Engine) ExecuteScopedDecay(ctx context.Context, req model.DecayRequest, refTime time.Time) (*model.DecayResponse, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	start := time.Now()
+	if refTime.IsZero() {
+		refTime = start.UTC()
+	}
+
+	decayed, archived, prunedEdges, protected, err := e.store.ApplyScopedDecay(ctx, req, refTime)
+	if err != nil {
+		return nil, fmt.Errorf("scoped decay failed: %w", err)
+	}
+
+	duration := float64(time.Since(start).Microseconds()) / 1000.0
+
+	// Collect updated telemetry statistics
+	storeStats, err := e.store.GetConsolidationStats(ctx)
+	if err == nil && storeStats != nil {
+		e.stats = *storeStats
+		e.stats.LastCycleAt = refTime
+		e.stats.LastCycleDurationMS = duration
+	}
+
+	scope := req.Scope
+	if scope == "" {
+		scope = "all"
+	}
+
+	log.Printf("[Accelerated Decay] Scope: %s | Decayed: %d | Archived: %d | Pruned Edges: %d | Protected: %d | Duration: %.2fms",
+		scope, decayed, archived, prunedEdges, protected, duration)
+
+	return &model.DecayResponse{
+		Status:         "success",
+		Scope:          scope,
+		NodesDecayed:   decayed,
+		NodesArchived:  archived,
+		EdgesPruned:    prunedEdges,
+		ProtectedNodes: protected,
+		DurationMS:     duration,
+	}, nil
+}
+
 // GetStats returns the latest telemetry statistics for the consolidation subsystem.
 func (e *Engine) GetStats(ctx context.Context) (model.ConsolidationStats, error) {
 	e.mu.RLock()

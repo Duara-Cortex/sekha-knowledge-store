@@ -57,6 +57,10 @@ func (f *FusionEngine) Fuse(ctx context.Context, extraction ExtractionResult, re
 			// Entity deduplication match: preserve existing persistent node ID
 			result.EntityIDMappings[extracted.ID] = existing.ID
 
+			if extracted.ImportanceScore > existing.ImportanceScore {
+				existing.ImportanceScore = extracted.ImportanceScore
+			}
+
 			// Hebbian stability reinforcement for recurring hub entities
 			deltaStability := f.config.HebbianLearningRate * extracted.Salience
 			if err := f.store.BoostNodeStability(ctx, existing.ID, deltaStability, refTime); err != nil {
@@ -75,7 +79,10 @@ func (f *FusionEngine) Fuse(ctx context.Context, extraction ExtractionResult, re
 			canonicalID := extracted.ID
 			result.EntityIDMappings[extracted.ID] = canonicalID
 
-			initialStability := 0.5 + (0.5 * extracted.Salience)
+			initialStability := extracted.ImportanceScore
+			if initialStability <= 0 {
+				initialStability = 0.5 + (0.5 * extracted.Salience)
+			}
 			if initialStability > 1.0 {
 				initialStability = 1.0
 			}
@@ -92,6 +99,7 @@ func (f *FusionEngine) Fuse(ctx context.Context, extraction ExtractionResult, re
 				LastReinforcedAt: refTime,
 				AccessCount:      1,
 				StabilityScore:   initialStability,
+				ImportanceScore:  extracted.ImportanceScore,
 				IsArchived:       false,
 			})
 			result.EntitiesCreated++

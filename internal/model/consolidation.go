@@ -1,6 +1,9 @@
 package model
 
 import (
+	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
 )
 
@@ -83,12 +86,13 @@ type ConsolidateResponse struct {
 
 // ExtractedEntity represents a salient concept, decision, or entity derived from an episodic trace.
 type ExtractedEntity struct {
-	ID         string    `json:"id"`
-	EntityType string    `json:"entity_type"`
-	Label      string    `json:"label"`
-	Summary    string    `json:"summary"`
-	Embedding  []float32 `json:"embedding,omitempty"`
-	Salience   float64   `json:"salience"`
+	ID              string    `json:"id"`
+	EntityType      string    `json:"entity_type"`
+	Label           string    `json:"label"`
+	Summary         string    `json:"summary"`
+	Embedding       []float32 `json:"embedding,omitempty"`
+	Salience        float64   `json:"salience"`
+	ImportanceScore float64   `json:"importance_score"`
 }
 
 // ExtractedRelation represents a causal, temporal, or co-activation link between extracted entities.
@@ -149,4 +153,81 @@ type ConsolidationTriggerResponse struct {
 	EdgesReinforced int                `json:"edges_reinforced"`
 	EdgesPruned     int                `json:"edges_pruned"`
 	Stats           ConsolidationStats `json:"stats"`
+}
+
+// DecayRequest defines the payload for on-demand task/session-scoped accelerated decay.
+type DecayRequest struct {
+	Scope                 string         `json:"scope"`                             // "transient" | "unanchored" | "session" | "all"
+	SessionID             string         `json:"session_id,omitempty"`              // Target session if scope="session"
+	DecayHalfLife         *time.Duration `json:"decay_half_life,omitempty"`         // Override tau (e.g. 1h)
+	InactivityGracePeriod *time.Duration `json:"inactivity_grace_period,omitempty"` // 0 for immediate pruning
+	PruneThreshold        *float64       `json:"prune_threshold,omitempty"`
+	MinImportanceToRetain float64        `json:"min_importance_to_retain"` // Threshold below which nodes decay (default 0.80)
+}
+
+// UnmarshalJSON implements custom JSON deserialization for DecayRequest to handle string durations (e.g., "1h", "0s") and numeric values.
+func (r *DecayRequest) UnmarshalJSON(data []byte) error {
+	type Alias DecayRequest
+	aux := struct {
+		DecayHalfLife         any `json:"decay_half_life,omitempty"`
+		InactivityGracePeriod any `json:"inactivity_grace_period,omitempty"`
+		*Alias
+	}{
+		Alias: (*Alias)(r),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+
+	if aux.DecayHalfLife != nil {
+		d, err := parseDurationFlexible(aux.DecayHalfLife)
+		if err != nil {
+			return fmt.Errorf("invalid decay_half_life: %w", err)
+		}
+		r.DecayHalfLife = d
+	}
+
+	if aux.InactivityGracePeriod != nil {
+		d, err := parseDurationFlexible(aux.InactivityGracePeriod)
+		if err != nil {
+			return fmt.Errorf("invalid inactivity_grace_period: %w", err)
+		}
+		r.InactivityGracePeriod = d
+	}
+
+	return nil
+}
+
+func parseDurationFlexible(v any) (*time.Duration, error) {
+	switch val := v.(type) {
+	case string:
+		clean := strings.TrimSpace(val)
+		if clean == "" {
+			return nil, nil
+		}
+		d, err := time.ParseDuration(clean)
+		if err != nil {
+			return nil, err
+		}
+		return &d, nil
+	case float64:
+		d := time.Duration(val)
+		return &d, nil
+	case int64:
+		d := time.Duration(val)
+		return &d, nil
+	default:
+		return nil, fmt.Errorf("unsupported duration type %T", v)
+	}
+}
+
+// DecayResponse returns counts and latency of a scoped accelerated decay execution.
+type DecayResponse struct {
+	Status         string  `json:"status"`
+	Scope          string  `json:"scope"`
+	NodesDecayed   int     `json:"nodes_decayed"`
+	NodesArchived  int     `json:"nodes_archived"`
+	EdgesPruned    int     `json:"edges_pruned"`
+	ProtectedNodes int     `json:"protected_nodes"`
+	DurationMS     float64 `json:"duration_ms"`
 }
