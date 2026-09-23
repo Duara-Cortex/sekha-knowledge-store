@@ -148,6 +148,40 @@ func (s *Server) handleRecall(w http.ResponseWriter, r *http.Request) {
 			req.Fields = queryFields
 		}
 	}
+	if q.Has("expand_neighbours") {
+		val := strings.ToLower(strings.TrimSpace(q.Get("expand_neighbours")))
+		b := (val == "true" || val == "1" || val == "yes")
+		req.ExpandNeighbours = &b
+	}
+	if q.Has("expand_hops") {
+		if val, err := strconv.Atoi(strings.TrimSpace(q.Get("expand_hops"))); err == nil {
+			req.ExpandHops = val
+		}
+	}
+	if q.Has("min_edge_weight") {
+		if val, err := strconv.ParseFloat(strings.TrimSpace(q.Get("min_edge_weight")), 64); err == nil {
+			req.MinEdgeWeight = &val
+		}
+	}
+	if q.Has("traverse_relations") {
+		var rels []string
+		for _, rVal := range q["traverse_relations"] {
+			for _, rItem := range strings.Split(rVal, ",") {
+				clean := strings.TrimSpace(rItem)
+				if clean != "" {
+					rels = append(rels, clean)
+				}
+			}
+		}
+		if len(rels) > 0 {
+			req.TraverseRelations = rels
+		}
+	}
+	if q.Has("attenuation_factor") {
+		if val, err := strconv.ParseFloat(strings.TrimSpace(q.Get("attenuation_factor")), 64); err == nil {
+			req.AttenuationFactor = &val
+		}
+	}
 
 	resp, err := s.engine.Recall(r.Context(), req)
 	if err != nil {
