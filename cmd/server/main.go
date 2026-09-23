@@ -9,12 +9,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/api"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/embedding"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/recall"
+	"github.com/Duara-Cortex/sekha-knowledge-store/internal/security"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/store"
 )
 
@@ -25,7 +27,28 @@ func main() {
 	alpha := flag.Float64("alpha", 0.6, "Default weight for semantic vector similarity")
 	beta := flag.Float64("beta", 0.2, "Default weight for access count frequency")
 	gamma := flag.Float64("gamma", 0.2, "Default weight for recency decay")
+	tlsCert := flag.String("tls-cert", "", "Path to TLS certificate file (or SEKHA_TLS_CERT env)")
+	tlsKey := flag.String("tls-key", "", "Path to TLS private key file (or SEKHA_TLS_KEY env)")
+	apiKeyFlag := flag.String("api-key", "", "API key for authentication (or SEKHA_API_KEY env)")
+	masterKeyFlag := flag.String("master-key", "", "Master key for encryption-at-rest (or SEKHA_MASTER_KEY env)")
 	flag.Parse()
+
+	certFile := strings.TrimSpace(*tlsCert)
+	if certFile == "" {
+		certFile = strings.TrimSpace(os.Getenv("SEKHA_TLS_CERT"))
+	}
+	keyFile := strings.TrimSpace(*tlsKey)
+	if keyFile == "" {
+		keyFile = strings.TrimSpace(os.Getenv("SEKHA_TLS_KEY"))
+	}
+	apiKey := strings.TrimSpace(*apiKeyFlag)
+	if apiKey == "" {
+		apiKey = strings.TrimSpace(os.Getenv("SEKHA_API_KEY"))
+	}
+	masterKey := strings.TrimSpace(*masterKeyFlag)
+	if masterKey == "" {
+		masterKey = strings.TrimSpace(os.Getenv("SEKHA_MASTER_KEY"))
+	}
 
 	log.Printf("[Sekha Long-Term Memory] Initialising Knowledge Graph Store on Node 1...")
 	log.Printf("[Config] Port: %d | DB: %s | Tau: %s | α: %.2f, β: %.2f, γ: %.2f",
@@ -38,12 +61,19 @@ func main() {
 		*dbPath = "knowledge.db"
 	}
 
+	// Initialise AES-256-GCM cipher for encryption at rest
+	cipher, err := security.NewAESGCMCipher(masterKey)
+	if err != nil {
+		log.Fatalf("[FATAL] Failed to initialise AES-GCM cipher: %v", err)
+	}
+
 	// Initialise SQLite store
 	sqliteStore, err := store.NewSQLiteStore(*dbPath)
 	if err != nil {
 		log.Fatalf("[FATAL] Failed to initialise SQLite store at %s: %v", *dbPath, err)
 	}
 	defer sqliteStore.Close()
+	sqliteStore.SetCipher(cipher)
 
 	embCfg := embedding.ConfigFromEnv()
 	var embedClient embedding.Embedder
@@ -68,6 +98,7 @@ func main() {
 		MaxCandidatePool:   20,
 		VectorDims:         embCfg.Dimension,
 		Embedder:           embedClient,
+		Cipher:             cipher,
 	}
 
 	engine, err := recall.NewEngine(ctx, sqliteStore, engineCfg)
@@ -86,10 +117,14 @@ func main() {
 	engine.StartBackgroundSync(syncCtx, 15*time.Second)
 
 	server := api.NewServer(sqliteStore, engine, *port)
+	if apiKey != "" {
+		server.SetAPIKey(apiKey)
+	}
+	handler := api.AuthMiddleware(apiKey, "/health", "/api/v1/memory/health")(server)
 
 	httpServer := &http.Server{
 		Addr:         fmt.Sprintf(":%d", *port),
-		Handler:      server,
+		Handler:      handler,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -100,9 +135,16 @@ func main() {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("[Sekha Knowledge Store] Listening on port %d", *port)
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("[FATAL] HTTP server failed: %v", err)
+		if certFile != "" && keyFile != "" {
+			log.Printf("[Sekha Knowledge Store] Listening with TLS/HTTPS on port %d (cert: %s)", *port, certFile)
+			if err := httpServer.ListenAndServeTLS(certFile, keyFile); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("[FATAL] HTTPS server failed: %v", err)
+			}
+		} else {
+			log.Printf("[Sekha Knowledge Store] Listening on port %d", *port)
+			if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("[FATAL] HTTP server failed: %v", err)
+			}
 		}
 	}()
 

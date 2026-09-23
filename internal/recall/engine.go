@@ -11,6 +11,7 @@ import (
 
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/embedding"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/model"
+	"github.com/Duara-Cortex/sekha-knowledge-store/internal/security"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/store"
 )
 
@@ -28,6 +29,7 @@ type EngineConfig struct {
 	MaxCandidatePool    int                // Max top vector seeds for graph expansion (default: 20)
 	VectorDims          int                // Dimensionality for dynamic query embeddings (default: 384)
 	Embedder            embedding.Embedder // Dense vector embedder client
+	Cipher              security.Cipher    // Secret encryption/decryption cipher
 }
 
 // DefaultConfig provides balanced cognitive recall defaults.
@@ -45,6 +47,7 @@ func DefaultConfig() EngineConfig {
 		MaxCandidatePool:    20,
 		VectorDims:          model.DefaultVectorDim, // 384
 		Embedder:            nil,
+		Cipher:              nil,
 	}
 }
 
@@ -65,6 +68,7 @@ type cachedNode struct {
 	stabilityScore  float64
 	importanceScore float64
 	anchors         map[string]struct{}
+	isSecret        bool
 }
 
 func buildTokenSets(label, summary string) (string, string, map[string]bool, map[string]bool, float64) {
@@ -289,12 +293,13 @@ func normalizeVector(vec []float32) ([]float32, float32) {
 
 // Engine implements the associative recall algorithm, in-memory vector index, and BM25 index.
 type Engine struct {
-	store store.Store
-	cfg   EngineConfig
-	mu    sync.RWMutex
-	nodes map[string]*cachedNode
-	index []*cachedNode
-	bm25  *bm25Index
+	store  store.Store
+	cfg    EngineConfig
+	cipher security.Cipher
+	mu     sync.RWMutex
+	nodes  map[string]*cachedNode
+	index  []*cachedNode
+	bm25   *bm25Index
 }
 
 // NewEngine creates and hydrates the associative recall engine from the underlying store.
@@ -318,10 +323,20 @@ func NewEngine(ctx context.Context, s store.Store, cfg EngineConfig) (*Engine, e
 		}
 	}
 
+	cipher := cfg.Cipher
+	if cipher == nil {
+		if cs, ok := s.(interface{ Cipher() security.Cipher }); ok && cs.Cipher() != nil {
+			cipher = cs.Cipher()
+		} else {
+			cipher, _ = security.NewAESGCMCipher("")
+		}
+	}
+
 	e := &Engine{
-		store: s,
-		cfg:   cfg,
-		nodes: make(map[string]*cachedNode),
+		store:  s,
+		cfg:    cfg,
+		cipher: cipher,
+		nodes:  make(map[string]*cachedNode),
 	}
 
 	if err := e.Hydrate(ctx); err != nil {
@@ -329,6 +344,20 @@ func NewEngine(ctx context.Context, s store.Store, cfg EngineConfig) (*Engine, e
 	}
 
 	return e, nil
+}
+
+// SetCipher configures the encryption cipher used for secret fields.
+func (e *Engine) SetCipher(c security.Cipher) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.cipher = c
+}
+
+// Cipher returns the configured encryption cipher.
+func (e *Engine) Cipher() security.Cipher {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.cipher
 }
 
 // SetEmbedder dynamically configures the dense embedding engine.
@@ -407,6 +436,7 @@ func (e *Engine) Hydrate(ctx context.Context) error {
 			stabilityScore:  h.StabilityScore,
 			importanceScore: h.ImportanceScore,
 			anchors:         anchorSet,
+			isSecret:        h.IsSecret,
 		}
 		e.nodes[cn.id] = cn
 		e.index = append(e.index, cn)
@@ -482,6 +512,7 @@ func (e *Engine) RegisterNodes(nodes []model.Node) {
 			if n.ImportanceScore > 0 {
 				cn.importanceScore = n.ImportanceScore
 			}
+			cn.isSecret = n.IsSecret
 			if len(anchorSet) > 0 {
 				if cn.anchors == nil {
 					cn.anchors = make(map[string]struct{})
@@ -508,6 +539,7 @@ func (e *Engine) RegisterNodes(nodes []model.Node) {
 				stabilityScore:  n.StabilityScore,
 				importanceScore: n.ImportanceScore,
 				anchors:         anchorSet,
+				isSecret:        n.IsSecret,
 			}
 			e.nodes[n.ID] = cn
 			e.index = append(e.index, cn)
@@ -553,6 +585,7 @@ type candidateScore struct {
 	impScore     float64
 	anchorScore  float64
 	hopDistance  int
+	isSecret     bool
 }
 
 // Recall executes the associative retrieval algorithm across dense semantic similarity,
@@ -829,6 +862,7 @@ func (e *Engine) Recall(ctx context.Context, req model.RecallRequest) (*model.Re
 			impScore:     impScore,
 			anchorScore:  anchorScore,
 			hopDistance:  0,
+			isSecret:     cn.isSecret,
 		}
 		candidates[cn.id] = cs
 		scoredList = append(scoredList, cs)
@@ -989,6 +1023,23 @@ func (e *Engine) Recall(ctx context.Context, req model.RecallRequest) (*model.Re
 		if !includeEmb {
 			fullNode.Embedding = nil
 		}
+		isSecret := fullNode.IsSecret || tc.isSecret
+		if isSecret {
+			fullNode.IsSecret = true
+			if req.IncludeSecrets {
+				if e.cipher != nil {
+					if dec, err := e.cipher.Decrypt(fullNode.Summary); err == nil {
+						fullNode.Summary = dec
+					}
+				}
+			} else {
+				if e.cipher != nil {
+					fullNode.Summary = e.cipher.Mask(fullNode.Summary)
+				} else {
+					fullNode.Summary = "[REDACTED_SECRET]"
+				}
+			}
+		}
 		dScore := math.Round(tc.denseScore*10000) / 10000
 		bScore := math.Round(tc.bm25Score*10000) / 10000
 		scoredNodes = append(scoredNodes, model.ScoredNode{
@@ -1002,6 +1053,7 @@ func (e *Engine) Recall(ctx context.Context, req model.RecallRequest) (*model.Re
 			ImportanceScore: math.Round(tc.impScore*10000) / 10000,
 			AnchorScore:     math.Round(tc.anchorScore*10000) / 10000,
 			HopDistance:     tc.hopDistance,
+			IsSecret:        isSecret,
 		})
 	}
 

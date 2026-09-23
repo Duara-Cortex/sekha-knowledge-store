@@ -20,6 +20,7 @@ type NodeHeader struct {
 	StabilityScore  float64
 	ImportanceScore float64
 	IsArchived      bool
+	IsSecret        bool
 	Anchors         []string
 }
 

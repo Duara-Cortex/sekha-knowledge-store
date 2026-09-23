@@ -14,6 +14,7 @@ import (
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/embedding"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/model"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/recall"
+	"github.com/Duara-Cortex/sekha-knowledge-store/internal/security"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/store"
 )
 
@@ -100,6 +101,7 @@ func (m *apiMockStore) InsertNodes(ctx context.Context, nodes []model.Node) (int
 			AccessCount:     n.AccessCount,
 			StabilityScore:  n.StabilityScore,
 			ImportanceScore: n.ImportanceScore,
+			IsSecret:        n.IsSecret,
 			Anchors:         m.anchors[n.ID],
 		})
 	}
@@ -1444,3 +1446,378 @@ func TestHandleDecayEndpoint(t *testing.T) {
 		}
 	}
 }
+
+func TestAPI_AuthMiddleware_Enforcement(t *testing.T) {
+	ctx := context.Background()
+	ms := newAPIMockStore()
+	engine, err := recall.NewEngine(ctx, ms, recall.DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	server := NewServer(ms, engine, 8084)
+	server.SetAPIKey("secret123")
+
+	// Protected endpoints to test
+	protectedEndpoints := []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{http.MethodPost, "/api/v1/memory/recall", `{"query": "test"}`},
+		{http.MethodPost, "/api/v1/memory/insert", `{"nodes": [], "edges": []}`},
+		{http.MethodPost, "/api/v1/memory/consolidate", `{"task_goal": "test", "session_id": "sess-1", "outcome": "success", "steps": []}`},
+		{http.MethodPost, "/api/v1/consolidation/decay", `{"scope": "unanchored"}`},
+		{http.MethodPost, "/api/v1/memory/decay", `{"scope": "unanchored"}`},
+	}
+
+	for _, ep := range protectedEndpoints {
+		t.Run("MissingKey_"+ep.path, func(t *testing.T) {
+			req := httptest.NewRequest(ep.method, ep.path, bytes.NewReader([]byte(ep.body)))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			server.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("expected 401 Unauthorized for %s, got: %d (%s)", ep.path, rec.Code, rec.Body.String())
+			}
+
+			var errResp map[string]string
+			if err := json.Unmarshal(rec.Body.Bytes(), &errResp); err != nil {
+				t.Fatalf("failed decoding 401 JSON error: %v", err)
+			}
+			if errResp["error"] != "unauthorized: invalid or missing API key" {
+				t.Errorf("expected error 'unauthorized: invalid or missing API key', got: %q", errResp["error"])
+			}
+		})
+
+		t.Run("InvalidKey_"+ep.path, func(t *testing.T) {
+			req := httptest.NewRequest(ep.method, ep.path, bytes.NewReader([]byte(ep.body)))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-API-Key", "wrong-key")
+			rec := httptest.NewRecorder()
+			server.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("expected 401 Unauthorized for invalid key on %s, got: %d", ep.path, rec.Code)
+			}
+		})
+
+		t.Run("InvalidBearer_"+ep.path, func(t *testing.T) {
+			req := httptest.NewRequest(ep.method, ep.path, bytes.NewReader([]byte(ep.body)))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer wrong-bearer-token")
+			rec := httptest.NewRecorder()
+			server.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("expected 401 Unauthorized for invalid bearer on %s, got: %d", ep.path, rec.Code)
+			}
+		})
+
+		t.Run("ValidXAPIKey_"+ep.path, func(t *testing.T) {
+			req := httptest.NewRequest(ep.method, ep.path, bytes.NewReader([]byte(ep.body)))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-API-Key", "secret123")
+			rec := httptest.NewRecorder()
+			server.ServeHTTP(rec, req)
+
+			if rec.Code == http.StatusUnauthorized {
+				t.Errorf("expected authorized access with valid X-API-Key on %s, got 401", ep.path)
+			}
+		})
+
+		t.Run("ValidBearer_"+ep.path, func(t *testing.T) {
+			req := httptest.NewRequest(ep.method, ep.path, bytes.NewReader([]byte(ep.body)))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer secret123")
+			rec := httptest.NewRecorder()
+			server.ServeHTTP(rec, req)
+
+			if rec.Code == http.StatusUnauthorized {
+				t.Errorf("expected authorized access with valid Bearer token on %s, got 401", ep.path)
+			}
+		})
+	}
+
+	// Public exemptions without credentials: GET /health and GET /api/v1/memory/health
+	publicEndpoints := []string{"/health", "/api/v1/memory/health"}
+	for _, pubPath := range publicEndpoints {
+		t.Run("PublicExemption_"+pubPath, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, pubPath, nil)
+			rec := httptest.NewRecorder()
+			server.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Errorf("expected 200 OK for public endpoint %s without credentials, got: %d (%s)", pubPath, rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestAPI_AuthMiddleware_PermissiveDevMode(t *testing.T) {
+	ctx := context.Background()
+	ms := newAPIMockStore()
+	engine, err := recall.NewEngine(ctx, ms, recall.DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	server := NewServer(ms, engine, 8084)
+	server.SetAPIKey("") // permissive / dev mode
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/memory/recall", bytes.NewReader([]byte(`{"query": "test"}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 OK in permissive dev mode when apiKey is empty, got: %d (%s)", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAPI_Recall_SecretMaskingAndPlaintextRecall(t *testing.T) {
+	ctx := context.Background()
+	ms := newAPIMockStore()
+
+	cipher, err := security.NewAESGCMCipher("api-test-master-key-xyz")
+	if err != nil {
+		t.Fatalf("failed creating cipher: %v", err)
+	}
+
+	cfg := recall.DefaultConfig()
+	cfg.Cipher = cipher
+	engine, err := recall.NewEngine(ctx, ms, cfg)
+	if err != nil {
+		t.Fatalf("failed creating recall engine: %v", err)
+	}
+
+	server := NewServer(ms, engine, 8084)
+	server.SetAPIKey("secret123")
+
+	secretPlain := "API_KEY=hvb_live_999 secret_token"
+	encSecret, err := cipher.Encrypt(secretPlain)
+	if err != nil {
+		t.Fatalf("failed encrypting secret: %v", err)
+	}
+
+	vaultRef := "vault://secrets/kestrel-api-key"
+	now := time.Now().UTC()
+
+	nodes := []model.Node{
+		{
+			ID:              "node-sec-api",
+			EntityType:      "credential",
+			Label:           "HVB Live API Key Node",
+			Summary:         encSecret,
+			IsSecret:        true,
+			Embedding:       embedding.Generate("HVB Live API Key Node", model.DefaultVectorDim),
+			CreatedAt:       now,
+			LastAccessedAt:  now,
+			StabilityScore:  1.0,
+			ImportanceScore: 0.9,
+		},
+		{
+			ID:              "node-vault-api",
+			EntityType:      "credential",
+			Label:           "Kestrel Vault URI Key Node",
+			Summary:         vaultRef,
+			IsSecret:        true,
+			Embedding:       embedding.Generate("Kestrel Vault URI Key Node", model.DefaultVectorDim),
+			CreatedAt:       now,
+			LastAccessedAt:  now,
+			StabilityScore:  1.0,
+			ImportanceScore: 0.9,
+		},
+	}
+	_, err = ms.InsertNodes(ctx, nodes)
+	if err != nil {
+		t.Fatalf("insert nodes failed: %v", err)
+	}
+	engine.RegisterNodes(nodes)
+
+	// 1. Recall without include_secrets (default) -> summary must be [REDACTED_SECRET]
+	reqRedacted := httptest.NewRequest(http.MethodPost, "/api/v1/memory/recall", bytes.NewReader([]byte(`{
+		"query": "HVB Live API Key Node",
+		"top_k": 5,
+		"include_secrets": false
+	}`)))
+	reqRedacted.Header.Set("Content-Type", "application/json")
+	reqRedacted.Header.Set("X-API-Key", "secret123")
+	recRedacted := httptest.NewRecorder()
+	server.ServeHTTP(recRedacted, reqRedacted)
+
+	if recRedacted.Code != http.StatusOK {
+		t.Fatalf("recall failed with status %d: %s", recRedacted.Code, recRedacted.Body.String())
+	}
+
+	var respRedacted model.RecallResponse
+	if err := json.Unmarshal(recRedacted.Body.Bytes(), &respRedacted); err != nil {
+		t.Fatalf("failed unmarshaling recall response: %v", err)
+	}
+
+	if len(respRedacted.Nodes) == 0 {
+		t.Fatalf("expected recalled nodes, got 0")
+	}
+
+	var foundSecret *model.ScoredNode
+	for i := range respRedacted.Nodes {
+		if respRedacted.Nodes[i].ID == "node-sec-api" {
+			foundSecret = &respRedacted.Nodes[i]
+			break
+		}
+	}
+	if foundSecret == nil {
+		t.Fatalf("node-sec-api not returned in recall")
+	}
+	if foundSecret.Summary != "[REDACTED_SECRET]" {
+		t.Errorf("expected redacted summary '[REDACTED_SECRET]', got: %q", foundSecret.Summary)
+	}
+	if !foundSecret.IsSecret {
+		t.Errorf("expected foundSecret.IsSecret to be true")
+	}
+
+	// 2. Recall with include_secrets: true -> decrypted plaintext summary returned
+	reqPlain := httptest.NewRequest(http.MethodPost, "/api/v1/memory/recall", bytes.NewReader([]byte(`{
+		"query": "HVB Live API Key Node",
+		"top_k": 5,
+		"include_secrets": true
+	}`)))
+	reqPlain.Header.Set("Content-Type", "application/json")
+	reqPlain.Header.Set("X-API-Key", "secret123")
+	recPlain := httptest.NewRecorder()
+	server.ServeHTTP(recPlain, reqPlain)
+
+	if recPlain.Code != http.StatusOK {
+		t.Fatalf("recall failed with status %d: %s", recPlain.Code, recPlain.Body.String())
+	}
+
+	var respPlain model.RecallResponse
+	if err := json.Unmarshal(recPlain.Body.Bytes(), &respPlain); err != nil {
+		t.Fatalf("failed unmarshaling recall response: %v", err)
+	}
+
+	var plainFound *model.ScoredNode
+	for i := range respPlain.Nodes {
+		if respPlain.Nodes[i].ID == "node-sec-api" {
+			plainFound = &respPlain.Nodes[i]
+			break
+		}
+	}
+	if plainFound == nil {
+		t.Fatalf("node-sec-api not returned in plain recall")
+	}
+	if plainFound.Summary != secretPlain {
+		t.Errorf("expected decrypted summary %q, got: %q", secretPlain, plainFound.Summary)
+	}
+
+	// 3. Vault URI node: include_secrets: false masks as [REDACTED_SECRET], include_secrets: true returns vault://
+	reqVaultRedacted := httptest.NewRequest(http.MethodPost, "/api/v1/memory/recall?include_secrets=false", bytes.NewReader([]byte(`{
+		"query": "Kestrel Vault URI Key Node",
+		"top_k": 5
+	}`)))
+	reqVaultRedacted.Header.Set("Content-Type", "application/json")
+	reqVaultRedacted.Header.Set("X-API-Key", "secret123")
+	recVaultRedacted := httptest.NewRecorder()
+	server.ServeHTTP(recVaultRedacted, reqVaultRedacted)
+
+	var respVR model.RecallResponse
+	_ = json.Unmarshal(recVaultRedacted.Body.Bytes(), &respVR)
+	for _, n := range respVR.Nodes {
+		if n.ID == "node-vault-api" {
+			if n.Summary != "[REDACTED_SECRET]" {
+				t.Errorf("expected vault reference to be masked when include_secrets=false, got: %q", n.Summary)
+			}
+		}
+	}
+
+	reqVaultPlain := httptest.NewRequest(http.MethodPost, "/api/v1/memory/recall?include_secrets=true", bytes.NewReader([]byte(`{
+		"query": "Kestrel Vault URI Key Node",
+		"top_k": 5
+	}`)))
+	reqVaultPlain.Header.Set("Content-Type", "application/json")
+	reqVaultPlain.Header.Set("X-API-Key", "secret123")
+	recVaultPlain := httptest.NewRecorder()
+	server.ServeHTTP(recVaultPlain, reqVaultPlain)
+
+	var respVP model.RecallResponse
+	_ = json.Unmarshal(recVaultPlain.Body.Bytes(), &respVP)
+	for _, n := range respVP.Nodes {
+		if n.ID == "node-vault-api" {
+			if n.Summary != vaultRef {
+				t.Errorf("expected vault reference %q preserved when include_secrets=true, got: %q", vaultRef, n.Summary)
+			}
+		}
+	}
+}
+
+func TestConsolidation_AuthMiddleware_Enforcement(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/consolidation/trigger", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "triggered"})
+	})
+	mux.HandleFunc("POST /api/v1/consolidation/decay", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "decayed"})
+	})
+	mux.HandleFunc("GET /api/v1/consolidation/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "healthy", "service": "sekha-consolidation"})
+	})
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "healthy"})
+	})
+
+	handler := AuthMiddleware("consolidation-secret-key", "/health", "/api/v1/consolidation/health")(mux)
+
+	// 1. Unauthenticated trigger -> 401
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/consolidation/trigger", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for unauthenticated trigger, got %d", rec.Code)
+	}
+
+	// 2. Unauthenticated decay -> 401
+	reqDecay := httptest.NewRequest(http.MethodPost, "/api/v1/consolidation/decay", bytes.NewReader([]byte(`{}`)))
+	recDecay := httptest.NewRecorder()
+	handler.ServeHTTP(recDecay, reqDecay)
+	if recDecay.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for unauthenticated decay, got %d", recDecay.Code)
+	}
+
+	// 3. Authenticated trigger with X-API-Key -> 200
+	reqAuth := httptest.NewRequest(http.MethodPost, "/api/v1/consolidation/trigger", nil)
+	reqAuth.Header.Set("X-API-Key", "consolidation-secret-key")
+	recAuth := httptest.NewRecorder()
+	handler.ServeHTTP(recAuth, reqAuth)
+	if recAuth.Code != http.StatusOK {
+		t.Errorf("expected 200 for authenticated trigger, got %d", recAuth.Code)
+	}
+
+	// 4. Authenticated trigger with Bearer -> 200
+	reqBearer := httptest.NewRequest(http.MethodPost, "/api/v1/consolidation/trigger", nil)
+	reqBearer.Header.Set("Authorization", "Bearer consolidation-secret-key")
+	recBearer := httptest.NewRecorder()
+	handler.ServeHTTP(recBearer, reqBearer)
+	if recBearer.Code != http.StatusOK {
+		t.Errorf("expected 200 for authenticated trigger with Bearer, got %d", recBearer.Code)
+	}
+
+	// 5. Health endpoints without credentials -> 200
+	for _, hp := range []string{"/health", "/api/v1/consolidation/health"} {
+		reqH := httptest.NewRequest(http.MethodGet, hp, nil)
+		recH := httptest.NewRecorder()
+		handler.ServeHTTP(recH, reqH)
+		if recH.Code != http.StatusOK {
+			t.Errorf("expected 200 for public health endpoint %s, got %d", hp, recH.Code)
+		}
+	}
+}
+

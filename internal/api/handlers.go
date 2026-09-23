@@ -27,6 +27,7 @@ type Server struct {
 	mux                 *http.ServeMux
 	startTime           time.Time
 	port                int
+	apiKey              string
 }
 
 // NewServer builds and registers all API routes for port 8084.
@@ -49,9 +50,20 @@ func NewServer(s store.Store, e *recall.Engine, port int) *Server {
 		mux:                 http.NewServeMux(),
 		startTime:           time.Now(),
 		port:                port,
+		apiKey:              os.Getenv("SEKHA_API_KEY"),
 	}
 	srv.registerRoutes()
 	return srv
+}
+
+// SetAPIKey configures the API key for endpoint authentication.
+func (s *Server) SetAPIKey(key string) {
+	s.apiKey = key
+}
+
+// APIKey returns the configured API key.
+func (s *Server) APIKey() string {
+	return s.apiKey
 }
 
 // SetEmbedder configures the dense embedding engine for the server.
@@ -89,10 +101,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key, Authorization")
 
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if s.apiKey != "" {
+		AuthMiddleware(s.apiKey, "/health", "/api/v1/memory/health")(s.mux).ServeHTTP(w, r)
 		return
 	}
 
@@ -127,6 +144,10 @@ func (s *Server) handleRecall(w http.ResponseWriter, r *http.Request) {
 	if q.Has("include_embeddings") {
 		val := strings.ToLower(strings.TrimSpace(q.Get("include_embeddings")))
 		req.IncludeEmbeddings = (val == "true" || val == "1" || val == "yes")
+	}
+	if q.Has("include_secrets") {
+		val := strings.ToLower(strings.TrimSpace(q.Get("include_secrets")))
+		req.IncludeSecrets = (val == "true" || val == "1" || val == "yes")
 	}
 	if q.Has("hybrid_alpha") {
 		if val, err := strconv.ParseFloat(strings.TrimSpace(q.Get("hybrid_alpha")), 64); err == nil {

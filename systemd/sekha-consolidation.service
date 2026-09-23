@@ -9,6 +9,7 @@ Type=simple
 User=admin
 Group=admin
 WorkingDirectory=/home/admin
+EnvironmentFile=-/etc/default/sekha
 ExecStart=/usr/local/bin/sekha-consolidation -port 8085 -db /var/lib/sekha/knowledge.db -cycle 15m -decay-tau 72h -prune-threshold 0.10 -edge-prune-threshold 0.05 -grace-period 168h -hebbian-rate 0.15 -max-weight 5.0
 Restart=always
 RestartSec=3

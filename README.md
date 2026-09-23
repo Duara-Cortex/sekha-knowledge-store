@@ -106,9 +106,39 @@ CREATE TABLE IF NOT EXISTS episodic_traces (
 | `POST` | `/api/v1/consolidation/trigger` | Triggers an immediate out-of-band consolidation, decay, and pruning cycle |
 | `POST` | `/api/v1/memory/consolidate` | Direct trace ingestion endpoint with optional synchronous consolidation |
 | `GET` | `/api/v1/consolidation/stats` | Telemetry on active vs archived nodes, reinforced edges, and mean stability |
-| `GET` | `/api/v1/consolidation/health` | Subsystem health telemetry |
+| `GET` | `/api/v1/consolidation/health` | Subsystem health telemetry (public unauthenticated) |
 
 ---
+
+## Security & Endpoint Hardening
+
+`sekha-knowledge-store` and `sekha-consolidation` provide defense-in-depth protections for edge and cluster deployments:
+
+1. **API Key & Bearer Token Authentication:**
+   - When `SEKHA_API_KEY` (or `--api-key`) is configured, all mutation and recall endpoints (`/recall`, `/insert`, `/consolidate`, `/decay`, `/trigger`, etc.) require authentication via:
+     - `X-API-Key: <key>`
+     - `Authorization: Bearer <key>`
+   - Requests without a valid key receive `401 Unauthorized` (`{"error": "unauthorized: invalid or missing API key"}`).
+   - **Public Exemption:** Telemetry and health check endpoints (`/health`, `/api/v1/memory/health`, `/api/v1/consolidation/health`) remain accessible without credentials so node monitoring daemons (such as `/usr/local/bin/sekha status`) function uninterrupted.
+   - If `SEKHA_API_KEY` is empty or unset, the daemons operate in permissive development mode with an explicit startup warning.
+
+2. **TLS / HTTPS Transport:**
+   - Both daemons support encrypted TLS transport via `--tls-cert` and `--tls-key` flags or `SEKHA_TLS_CERT` and `SEKHA_TLS_KEY` environment variables.
+   - When both certificate and key are provided, servers listen over HTTPS with TLS 1.2/1.3.
+
+3. **AES-256-GCM Encryption-at-Rest (`is_secret`):**
+   - The relational schema includes an `is_secret INTEGER NOT NULL DEFAULT 0` column on the `nodes` table.
+   - When `is_secret: true` is passed during node insertion:
+     - The node summary/payload is encrypted using AES-256-GCM with a 12-byte cryptographically secure random nonce.
+     - Ciphertext is persisted with standard prefix format: `enc:v1:<base64(12-byte nonce + ciphertext + 16-byte tag)>`.
+     - The encryption key is derived via SHA-256 from `SEKHA_MASTER_KEY` (or `/etc/sekha/master.key` with `0600` permissions).
+     - Plaintext secrets never appear in the SQLite database file or WAL logs.
+   - **Vault / Secret Manager References:** Values starting with `vault://` or `env://` are recognized as external URI references and preserved without double-encryption.
+
+4. **Secret Masking & Redaction on Recall:**
+   - By default, secret nodes retrieved during associative recall have their summaries masked as `[REDACTED_SECRET]` to prevent accidental prompt injection or leakage to unauthorized agents.
+   - When `include_secrets: true` is provided in the JSON body (or `?include_secrets=true` query parameter) of an authenticated recall request, the payload is decrypted and returned in plaintext.
+
 
 ## Building & Installation
 
@@ -185,11 +215,25 @@ SEKHA_EMBEDDING_DIM=384
 
 # Request timeout in milliseconds
 SEKHA_EMBEDDING_TIMEOUT_MS=500
+
+# Optional API key for embedding service on Port 8086 (falls back to SEKHA_API_KEY if unset)
+# SEKHA_EMBEDDING_API_KEY=your_embedding_service_key_here
+
+# Security & Authentication Configuration
+# Set an API key to enforce authentication across non-health endpoints (pass via X-API-Key or Bearer token)
+SEKHA_API_KEY=your_cluster_secret_key_here
+
+# Node-local master key for AES-256-GCM encryption-at-rest (or stored in /etc/sekha/master.key)
+SEKHA_MASTER_KEY=your_secure_random_node_master_key_here
+
+# TLS / HTTPS transport configuration (optional)
+# SEKHA_TLS_CERT=/etc/ssl/certs/sekha.crt
+# SEKHA_TLS_KEY=/etc/ssl/private/sekha.key
 ```
 
-After modifying `/etc/default/sekha`, restart the service to apply changes:
+After modifying `/etc/default/sekha`, restart the services to apply changes:
 ```bash
-sudo systemctl restart sekha-knowledge-store
+sudo systemctl restart sekha-knowledge-store sekha-consolidation
 ```
 
 ### Windows & macOS Environments (`.env`)
@@ -202,6 +246,13 @@ Because Windows does not have an `/etc` directory and does not use `systemd`, **
    SEKHA_EMBEDDING_URL=http://<embedding-host>:<port>/v1/embeddings
    SEKHA_EMBEDDING_DIM=384
    SEKHA_EMBEDDING_TIMEOUT_MS=500
+   # SEKHA_EMBEDDING_API_KEY=your_embedding_service_key_here
+
+   # Security & Authentication
+   SEKHA_API_KEY=your_cluster_secret_key_here
+   SEKHA_MASTER_KEY=your_secure_random_node_master_key_here
+   # SEKHA_TLS_CERT=/path/to/sekha.crt
+   # SEKHA_TLS_KEY=/path/to/sekha.key
    ```
 
 2. The application automatically detects and loads `.env` upon startup on Windows and macOS:
