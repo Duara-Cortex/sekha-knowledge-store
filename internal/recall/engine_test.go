@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"math/rand"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/Duara-Cortex/sekha-knowledge-store/internal/embedding"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/model"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/store"
 )
@@ -1123,6 +1126,456 @@ func TestRecallEngine_HybridModesAndAlpha(t *testing.T) {
 	expectedSim := 0.80*(*respCustom.Nodes[0].DenseScore) + 0.20*(*respCustom.Nodes[0].BM25Score)
 	if math.Abs(respCustom.Nodes[0].SimScore-math.Round(expectedSim*10000)/10000) > 1e-3 {
 		t.Fatalf("expected sim_score %.4f, got %.4f", expectedSim, respCustom.Nodes[0].SimScore)
+	}
+}
+
+func TestRecallEngine_DefaultSafeBehaviour_ExpansionOmitted(t *testing.T) {
+	ctx := context.Background()
+	ms := newMockStore()
+	now := time.Now().UTC()
+
+	nA := model.Node{
+		ID:             "node-A",
+		EntityType:     "concept",
+		Label:          "Primary Seed Node A",
+		Summary:        "High relevance target node",
+		Embedding:      []float32{0.9, 0.1},
+		CreatedAt:      now,
+		LastAccessedAt: now,
+		AccessCount:    50,
+		StabilityScore: 1.0,
+	}
+	nB := model.Node{
+		ID:             "node-B",
+		EntityType:     "concept",
+		Label:          "Unrelated Neighbour Node B",
+		Summary:        "Low relevance node connected by edge",
+		Embedding:      []float32{0.1, 0.9},
+		CreatedAt:      now,
+		LastAccessedAt: now,
+		AccessCount:    1,
+		StabilityScore: 1.0,
+	}
+
+	_, _ = ms.InsertNodes(ctx, []model.Node{nA, nB})
+	_, _ = ms.InsertEdges(ctx, []model.Edge{
+		{SourceID: "node-A", TargetID: "node-B", RelationType: "depends_on", Weight: 1.0, CreatedAt: now},
+	})
+
+	engine, err := NewEngine(ctx, ms, DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	// 1. When expand_neighbours is omitted: no edges loaded, no 1-hop expansion
+	reqDefault := model.RecallRequest{
+		Embedding: []float32{0.9, 0.1},
+		TopK:      2,
+	}
+	respDefault, err := engine.Recall(ctx, reqDefault)
+	if err != nil {
+		t.Fatalf("recall failed: %v", err)
+	}
+	if len(respDefault.Edges) != 0 {
+		t.Fatalf("expected 0 edges when expansion is omitted by default, got %d", len(respDefault.Edges))
+	}
+	for _, n := range respDefault.Nodes {
+		if n.HopDistance != 0 {
+			t.Fatalf("expected hop_distance 0 when expansion is omitted, got %d for %s", n.HopDistance, n.ID)
+		}
+	}
+
+	// 2. When expand_neighbours is explicitly false: no expansion even if expand_hops > 0
+	expFalse := false
+	reqFalse := model.RecallRequest{
+		Embedding:        []float32{0.9, 0.1},
+		TopK:             2,
+		ExpandNeighbours: &expFalse,
+		ExpandHops:       1,
+	}
+	respFalse, err := engine.Recall(ctx, reqFalse)
+	if err != nil {
+		t.Fatalf("recall failed: %v", err)
+	}
+	if len(respFalse.Edges) != 0 {
+		t.Fatalf("expected 0 edges when expand_neighbours is false, got %d", len(respFalse.Edges))
+	}
+
+	// 3. When expand_neighbours is true: 1-hop neighbour node-B is boosted and edges returned
+	expTrue := true
+	reqTrue := model.RecallRequest{
+		Embedding:        []float32{0.9, 0.1},
+		TopK:             2,
+		Alpha:            0.7,
+		Beta:             0.1,
+		Gamma:            0.2,
+		ExpandNeighbours: &expTrue,
+	}
+	respTrue, err := engine.Recall(ctx, reqTrue)
+	if err != nil {
+		t.Fatalf("recall failed: %v", err)
+	}
+	if len(respTrue.Edges) == 0 {
+		t.Fatalf("expected edges returned when expansion is active")
+	}
+	if len(respTrue.Nodes) < 2 || respTrue.Nodes[1].ID != "node-B" {
+		t.Fatalf("expected node-B in top 2 when expansion is active")
+	}
+	if respTrue.Nodes[1].HopDistance != 1 {
+		t.Fatalf("expected hop_distance 1 for 1-hop neighbour, got %d", respTrue.Nodes[1].HopDistance)
+	}
+}
+
+func TestRecallEngine_EdgeWeightThresholdGating(t *testing.T) {
+	ctx := context.Background()
+	ms := newMockStore()
+	now := time.Now().UTC()
+
+	seedNode := model.Node{
+		ID:             "seed-node",
+		EntityType:     "concept",
+		Label:          "Seed Concept",
+		Summary:        "Primary seed entity",
+		Embedding:      []float32{1.0, 0.0},
+		CreatedAt:      now,
+		LastAccessedAt: now,
+		AccessCount:    50,
+		StabilityScore: 1.0,
+	}
+	weakNeighbour := model.Node{
+		ID:             "weak-neighbour",
+		EntityType:     "concept",
+		Label:          "Weak Neighbour Concept",
+		Summary:        "Connected via sub-threshold edge",
+		Embedding:      []float32{0.0, 1.0},
+		CreatedAt:      now,
+		LastAccessedAt: now,
+		AccessCount:    5,
+		StabilityScore: 1.0,
+	}
+	strongNeighbour := model.Node{
+		ID:             "strong-neighbour",
+		EntityType:     "concept",
+		Label:          "Strong Neighbour Concept",
+		Summary:        "Connected via supra-threshold edge",
+		Embedding:      []float32{0.0, 1.0},
+		CreatedAt:      now,
+		LastAccessedAt: now,
+		AccessCount:    5,
+		StabilityScore: 1.0,
+	}
+
+	_, _ = ms.InsertNodes(ctx, []model.Node{seedNode, weakNeighbour, strongNeighbour})
+	_, _ = ms.InsertEdges(ctx, []model.Edge{
+		{SourceID: "seed-node", TargetID: "weak-neighbour", RelationType: "depends_on", Weight: 0.45, CreatedAt: now},
+		{SourceID: "seed-node", TargetID: "strong-neighbour", RelationType: "depends_on", Weight: 0.85, CreatedAt: now},
+	})
+
+	engine, err := NewEngine(ctx, ms, DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	expTrue := true
+	weightThresh := 0.60
+
+	// Acceptance Criterion 2: An edge with weight 0.45 connected to a high-scoring seed is ignored when min_edge_weight = 0.60
+	req := model.RecallRequest{
+		Embedding:        []float32{1.0, 0.0},
+		TopK:             3,
+		ExpandNeighbours: &expTrue,
+		MinEdgeWeight:    &weightThresh,
+	}
+
+	resp, err := engine.Recall(ctx, req)
+	if err != nil {
+		t.Fatalf("recall failed: %v", err)
+	}
+
+	for _, edge := range resp.Edges {
+		if edge.TargetID == "weak-neighbour" || edge.SourceID == "weak-neighbour" {
+			t.Fatalf("edge with weight 0.45 should have been gated out, but was returned: %+v", edge)
+		}
+	}
+
+	foundStrong := false
+	for _, n := range resp.Nodes {
+		if n.ID == "strong-neighbour" {
+			foundStrong = true
+			if n.HopDistance != 1 {
+				t.Fatalf("expected strong-neighbour hop_distance = 1, got %d", n.HopDistance)
+			}
+		}
+		if n.ID == "weak-neighbour" && n.HopDistance != 0 {
+			t.Fatalf("weak-neighbour should not be traversed, got hop_distance %d", n.HopDistance)
+		}
+	}
+	if !foundStrong {
+		t.Fatalf("expected strong-neighbour to be recalled")
+	}
+}
+
+func TestRecallEngine_RelationTypeFiltering(t *testing.T) {
+	ctx := context.Background()
+	ms := newMockStore()
+	now := time.Now().UTC()
+
+	seedNode := model.Node{
+		ID:             "seed-node",
+		EntityType:     "concept",
+		Label:          "Seed Node",
+		Summary:        "Primary concept",
+		Embedding:      []float32{1.0, 0.0},
+		CreatedAt:      now,
+		LastAccessedAt: now,
+		AccessCount:    50,
+		StabilityScore: 1.0,
+	}
+	nodeAnchor := model.Node{
+		ID:             "node-anchor",
+		EntityType:     "concept",
+		Label:          "Anchored Node",
+		Summary:        "Linked via anchored_to",
+		Embedding:      []float32{0.0, 1.0},
+		CreatedAt:      now,
+		LastAccessedAt: now,
+		AccessCount:    5,
+		StabilityScore: 1.0,
+	}
+	nodeSubgoal := model.Node{
+		ID:             "node-subgoal",
+		EntityType:     "concept",
+		Label:          "Subgoal Node",
+		Summary:        "Linked via subgoal_of",
+		Embedding:      []float32{0.0, 1.0},
+		CreatedAt:      now,
+		LastAccessedAt: now,
+		AccessCount:    5,
+		StabilityScore: 1.0,
+	}
+
+	_, _ = ms.InsertNodes(ctx, []model.Node{seedNode, nodeAnchor, nodeSubgoal})
+	_, _ = ms.InsertEdges(ctx, []model.Edge{
+		{SourceID: "seed-node", TargetID: "node-anchor", RelationType: "anchored_to", Weight: 0.90, CreatedAt: now},
+		{SourceID: "seed-node", TargetID: "node-subgoal", RelationType: "subgoal_of", Weight: 0.90, CreatedAt: now},
+	})
+
+	engine, err := NewEngine(ctx, ms, DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	expTrue := true
+	// Acceptance Criterion 3: When traverse_relations = ["anchored_to"], an edge of type "subgoal_of" is skipped even if weight >= 0.60
+	req := model.RecallRequest{
+		Embedding:         []float32{1.0, 0.0},
+		TopK:              3,
+		ExpandNeighbours:  &expTrue,
+		TraverseRelations: []string{"anchored_to"},
+	}
+
+	resp, err := engine.Recall(ctx, req)
+	if err != nil {
+		t.Fatalf("recall failed: %v", err)
+	}
+
+	if len(resp.Edges) != 1 {
+		t.Fatalf("expected exactly 1 edge traversed, got %d", len(resp.Edges))
+	}
+	if resp.Edges[0].RelationType != "anchored_to" {
+		t.Fatalf("expected traversed edge to be anchored_to, got %s", resp.Edges[0].RelationType)
+	}
+
+	for _, n := range resp.Nodes {
+		if n.ID == "node-anchor" && n.HopDistance != 1 {
+			t.Fatalf("expected node-anchor to have hop_distance 1, got %d", n.HopDistance)
+		}
+		if n.ID == "node-subgoal" && n.HopDistance != 0 {
+			t.Fatalf("expected node-subgoal to have hop_distance 0 (not traversed), got %d", n.HopDistance)
+		}
+	}
+}
+
+func TestRecallEngine_DisplacementGuard(t *testing.T) {
+	ctx := context.Background()
+	ms := newMockStore()
+	now := time.Now().UTC()
+
+	// Seed synthetic 216-node / 866-edge graph
+	topics := []string{
+		"network port timeout settings",
+		"buffer retry queue overflow threshold",
+		"keepalive heartbeat socket drop",
+		"rpc connection deadline limit",
+		"circuit breaker error rate tripping",
+		"ingress gateway listen port binding",
+		"memory buffer pool eviction policy",
+		"grpc stream flow control window",
+		"packet drop mitigation strategy",
+		"mtu discovery and payload fragmentation",
+		"connection pool max idle timeout",
+		"service mesh proxy routing table",
+		"tls certificate handshake timeout",
+		"dns resolver query retry interval",
+		"thread pool worker starvation limit",
+		"rate limiter burst token bucket capacity",
+		"write ahead log sync flush interval",
+		"cluster quorum election timeout",
+	}
+	variations := []string{"config", "spec", "rule"}
+
+	var nodes []model.Node
+	var gannetryIDs []string
+	var distractorIDs []string
+
+	// 54 Gannetry Target Nodes
+	for _, top := range topics {
+		for _, v := range variations {
+			id := fmt.Sprintf("gannetry-%s-%s", strings.ReplaceAll(top, " ", "-"), v)
+			label := fmt.Sprintf("Project Gannetry %s %s", v, top)
+			summary := fmt.Sprintf("Project Gannetry production %s for %s", v, top)
+			emb := embedding.Generate(label+" "+summary, 384)
+			gannetryIDs = append(gannetryIDs, id)
+			nodes = append(nodes, model.Node{
+				ID:             id,
+				EntityType:     "decision",
+				Label:          label,
+				Summary:        summary,
+				Embedding:      emb,
+				Anchors:        []string{"#project:gannetry"},
+				CreatedAt:      now.Add(-24 * time.Hour),
+				LastAccessedAt: now.Add(-30 * time.Minute),
+				AccessCount:    35,
+				StabilityScore: 1.0,
+			})
+		}
+	}
+
+	// 162 Distractor / Decoy Nodes (Tern, Cormorant, Generic)
+	for _, proj := range []string{"Tern", "Cormorant", "Generic"} {
+		for _, top := range topics {
+			for _, v := range variations {
+				id := fmt.Sprintf("dist-%s-%s-%s", strings.ToLower(proj), strings.ReplaceAll(top, " ", "-"), v)
+				label := fmt.Sprintf("%s System %s %s", proj, v, top)
+				summary := fmt.Sprintf("%s daemon %s for %s with port timeout and subgoal_of scheduler", proj, v, top)
+				emb := embedding.Generate(label+" "+summary, 384)
+				distractorIDs = append(distractorIDs, id)
+				nodes = append(nodes, model.Node{
+					ID:             id,
+					EntityType:     "concept",
+					Label:          label,
+					Summary:        summary,
+					Embedding:      emb,
+					CreatedAt:      now.Add(-6 * time.Hour),
+					LastAccessedAt: now.Add(-5 * time.Minute),
+					AccessCount:    45,
+					StabilityScore: 1.0,
+				})
+			}
+		}
+	}
+
+	var edges []model.Edge
+	edgeSet := make(map[string]bool)
+	addEdge := func(src, tgt, rel string, weight float64) {
+		if src == tgt {
+			return
+		}
+		k := fmt.Sprintf("%s->%s:%s", src, tgt, rel)
+		if !edgeSet[k] {
+			edgeSet[k] = true
+			edges = append(edges, model.Edge{
+				SourceID:     src,
+				TargetID:     tgt,
+				RelationType: rel,
+				Weight:       weight,
+				CreatedAt:    now,
+			})
+		}
+	}
+
+	rng := rand.New(rand.NewSource(42))
+
+	// 250 high weight intra-Gannetry edges (w >= 0.70)
+	for i := 0; i < len(gannetryIDs) && len(edges) < 250; i++ {
+		tgt := gannetryIDs[(i+1)%len(gannetryIDs)]
+		addEdge(gannetryIDs[i], tgt, "depends_on", 0.85)
+		tgt2 := gannetryIDs[(i+2)%len(gannetryIDs)]
+		addEdge(gannetryIDs[i], tgt2, "subgoal_of", 0.80)
+	}
+	for len(edges) < 250 {
+		src := gannetryIDs[rng.Intn(len(gannetryIDs))]
+		tgt := gannetryIDs[rng.Intn(len(gannetryIDs))]
+		addEdge(src, tgt, "anchored_to", 0.75)
+	}
+
+	// 300 weak incidental edges connecting Gannetry to distractors (w = 0.40)
+	for len(edges) < 550 {
+		src := gannetryIDs[rng.Intn(len(gannetryIDs))]
+		tgt := distractorIDs[rng.Intn(len(distractorIDs))]
+		addEdge(src, tgt, "incidental_mention", 0.40)
+	}
+
+	// 316 inter-distractor edges
+	for len(edges) < 866 {
+		src := distractorIDs[rng.Intn(len(distractorIDs))]
+		tgt := distractorIDs[rng.Intn(len(distractorIDs))]
+		addEdge(src, tgt, "relates_to", 0.55)
+	}
+
+	if len(nodes) != 216 {
+		t.Fatalf("expected exactly 216 nodes, got %d", len(nodes))
+	}
+	if len(edges) != 866 {
+		t.Fatalf("expected exactly 866 edges, got %d", len(edges))
+	}
+
+	_, _ = ms.InsertNodes(ctx, nodes)
+	_, _ = ms.InsertEdges(ctx, edges)
+
+	engine, err := NewEngine(ctx, ms, DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	// Acceptance Criterion 1: Displacement Prevention
+	// On the 216-node / 866-edge seeded graph, a query for target fact surfaces direct target at Rank 1 with hit rate >= 90.0%
+	queryCount := 100
+	hitCount := 0
+	expTrue := true
+	minW := 0.60
+	attn := 0.35
+
+	for i := 0; i < queryCount; i++ {
+		top := topics[i%len(topics)]
+		v := variations[(i/len(topics))%len(variations)]
+		q := fmt.Sprintf("Project Gannetry %s %s", v, top)
+		expectedID := fmt.Sprintf("gannetry-%s-%s", strings.ReplaceAll(top, " ", "-"), v)
+
+		resp, err := engine.Recall(ctx, model.RecallRequest{
+			Query:             q,
+			TopK:              5,
+			ExpandNeighbours:  &expTrue,
+			MinEdgeWeight:     &minW,
+			TraverseRelations: []string{"depends_on", "subgoal_of", "anchored_to"},
+			AttenuationFactor: &attn,
+		})
+		if err != nil {
+			t.Fatalf("recall query %d failed: %v", i, err)
+		}
+
+		if len(resp.Nodes) > 0 && resp.Nodes[0].ID == expectedID {
+			hitCount++
+			if resp.Nodes[0].HopDistance != 0 {
+				t.Fatalf("Rank 1 direct target must have hop_distance 0, got %d", resp.Nodes[0].HopDistance)
+			}
+		}
+	}
+
+	hitRate := float64(hitCount) / float64(queryCount) * 100.0
+	t.Logf("216-Node / 866-Edge Graph Target Rank 1 Hit Rate: %.1f%% (Required: >= 90.0%%)", hitRate)
+	if hitRate < 90.0 {
+		t.Fatalf("expected Rank 1 hit rate >= 90.0%%, got %.1f%%", hitRate)
 	}
 }
 

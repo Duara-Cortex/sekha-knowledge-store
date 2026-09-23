@@ -1188,3 +1188,160 @@ func TestAPIRecall_HybridParameters(t *testing.T) {
 	}
 }
 
+func TestAPIRecall_GatedNeighbourExpansionQueryParameters(t *testing.T) {
+	ctx := context.Background()
+	ms := newAPIMockStore()
+	now := time.Now().UTC()
+
+	seedNode := model.Node{
+		ID:             "api-seed",
+		EntityType:     "concept",
+		Label:          "API Primary Seed Node",
+		Summary:        "Primary seed entity for recall",
+		Embedding:      []float32{1.0, 0.0},
+		CreatedAt:      now,
+		LastAccessedAt: now,
+		AccessCount:    50,
+		StabilityScore: 1.0,
+	}
+	weakNeighbour := model.Node{
+		ID:             "api-weak-neighbour",
+		EntityType:     "concept",
+		Label:          "API Weak Neighbour Node",
+		Summary:        "Connected via sub-threshold weight edge",
+		Embedding:      []float32{0.0, 1.0},
+		CreatedAt:      now,
+		LastAccessedAt: now,
+		AccessCount:    2,
+		StabilityScore: 1.0,
+	}
+	strongNeighbour := model.Node{
+		ID:             "api-strong-neighbour",
+		EntityType:     "concept",
+		Label:          "API Strong Neighbour Node",
+		Summary:        "Connected via valid edge",
+		Embedding:      []float32{0.0, 1.0},
+		CreatedAt:      now,
+		LastAccessedAt: now,
+		AccessCount:    2,
+		StabilityScore: 1.0,
+	}
+	subgoalNeighbour := model.Node{
+		ID:             "api-subgoal-neighbour",
+		EntityType:     "concept",
+		Label:          "API Subgoal Neighbour Node",
+		Summary:        "Connected via non-whitelisted relation",
+		Embedding:      []float32{0.0, 1.0},
+		CreatedAt:      now,
+		LastAccessedAt: now,
+		AccessCount:    2,
+		StabilityScore: 1.0,
+	}
+
+	_, _ = ms.InsertNodes(ctx, []model.Node{seedNode, weakNeighbour, strongNeighbour, subgoalNeighbour})
+	_, _ = ms.InsertEdges(ctx, []model.Edge{
+		{SourceID: "api-seed", TargetID: "api-weak-neighbour", RelationType: "depends_on", Weight: 0.45, CreatedAt: now},
+		{SourceID: "api-seed", TargetID: "api-strong-neighbour", RelationType: "depends_on", Weight: 0.85, CreatedAt: now},
+		{SourceID: "api-seed", TargetID: "api-subgoal-neighbour", RelationType: "subgoal_of", Weight: 0.90, CreatedAt: now},
+	})
+
+	engine, err := recall.NewEngine(ctx, ms, recall.DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed creating engine: %v", err)
+	}
+
+	server := NewServer(ms, engine, 8084)
+
+	// 1. Test query param overrides: expand_neighbours=true, min_edge_weight=0.60, traverse_relations=depends_on, attenuation_factor=0.35
+	urlStr := "/api/v1/memory/recall?expand_neighbours=true&min_edge_weight=0.60&traverse_relations=depends_on&attenuation_factor=0.35"
+	body, _ := json.Marshal(model.RecallRequest{
+		Embedding: []float32{1.0, 0.0},
+		TopK:      4,
+	})
+	httpReq := httptest.NewRequest(http.MethodPost, urlStr, bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, httpReq)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp model.RecallResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed unmarshaling recall response: %v", err)
+	}
+
+	// Verify only the strong neighbour (depends_on with weight 0.85) was traversed
+	if len(resp.Edges) != 1 {
+		t.Fatalf("expected 1 edge in subgraph, got %d", len(resp.Edges))
+	}
+	if resp.Edges[0].TargetID != "api-strong-neighbour" {
+		t.Fatalf("expected edge to api-strong-neighbour, got %+v", resp.Edges[0])
+	}
+
+	// Verify hop_distance is preserved in ScoredNodeDTO JSON
+	foundStrong := false
+	for _, n := range resp.Nodes {
+		if n.ID == "api-strong-neighbour" {
+			foundStrong = true
+			if n.HopDistance != 1 {
+				t.Fatalf("expected hop_distance 1 on strong neighbour, got %d", n.HopDistance)
+			}
+		}
+		if n.ID == "api-weak-neighbour" && n.HopDistance != 0 {
+			t.Fatalf("expected hop_distance 0 on untraversed weak neighbour, got %d", n.HopDistance)
+		}
+	}
+	if !foundStrong {
+		t.Fatalf("expected api-strong-neighbour to be recalled")
+	}
+
+	// Also verify raw JSON contains "hop_distance": 1
+	var rawJSON map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &rawJSON); err != nil {
+		t.Fatalf("failed unmarshaling raw json: %v", err)
+	}
+	nodesArr, ok := rawJSON["nodes"].([]any)
+	if !ok || len(nodesArr) == 0 {
+		t.Fatalf("expected nodes array in raw json")
+	}
+	hasHopDistanceInJSON := false
+	for _, item := range nodesArr {
+		nodeMap, ok := item.(map[string]any)
+		if ok && nodeMap["id"] == "api-strong-neighbour" {
+			if hd, exists := nodeMap["hop_distance"]; exists {
+				hasHopDistanceInJSON = true
+				if hdFloat, ok := hd.(float64); !ok || int(hdFloat) != 1 {
+					t.Fatalf("expected hop_distance 1 in JSON, got %v", hd)
+				}
+			}
+		}
+	}
+	if !hasHopDistanceInJSON {
+		t.Fatalf("expected hop_distance field to be preserved in JSON response for 1-hop neighbour")
+	}
+
+	// 2. Test field projection schema preserving hop_distance
+	projURL := "/api/v1/memory/recall?expand_neighbours=true&fields=id,label,hop_distance,score"
+	httpReqProj := httptest.NewRequest(http.MethodPost, projURL, bytes.NewReader(body))
+	recProj := httptest.NewRecorder()
+	server.ServeHTTP(recProj, httpReqProj)
+
+	if recProj.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recProj.Code)
+	}
+
+	var rawProj map[string]any
+	if err := json.Unmarshal(recProj.Body.Bytes(), &rawProj); err != nil {
+		t.Fatalf("failed unmarshaling projected json: %v", err)
+	}
+	projNodes, ok := rawProj["nodes"].([]any)
+	if !ok || len(projNodes) == 0 {
+		t.Fatalf("expected projected nodes array")
+	}
+	firstProj := projNodes[0].(map[string]any)
+	if _, exists := firstProj["hop_distance"]; !exists {
+		t.Fatalf("expected projected node to include hop_distance field")
+	}
+}
+

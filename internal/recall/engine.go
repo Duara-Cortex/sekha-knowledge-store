@@ -552,10 +552,6 @@ func (e *Engine) Recall(ctx context.Context, req model.RecallRequest) (*model.Re
 	if topK <= 0 {
 		topK = 5
 	}
-	expandHops := req.ExpandHops
-	if expandHops < 0 {
-		expandHops = 1
-	}
 
 	alpha := req.Alpha
 	beta := req.Beta
@@ -826,42 +822,94 @@ func (e *Engine) Recall(ctx context.Context, req model.RecallRequest) (*model.Re
 
 	// 5. Hybrid Semantic Search + 1-Hop Graph Neighbour Expansion
 	var relevantEdges []model.Edge
-	if expandHops >= 1 && len(seedIDs) > 0 {
+	if req.ShouldExpandNeighbours() && len(seedIDs) > 0 {
 		edges, err := e.store.GetEdgesForNodes(ctx, seedIDs)
 		if err != nil {
 			return nil, fmt.Errorf("failed fetching graph edges for recall: %w", err)
 		}
-		relevantEdges = edges
+
+		minEdgeWeight := req.GetMinEdgeWeight(0.60)
+		delta := req.GetAttenuationFactor(e.cfg.NeighbourHopBoost)
+
+		var allowedRelations map[string]struct{}
+		if len(req.TraverseRelations) > 0 {
+			allowedRelations = make(map[string]struct{}, len(req.TraverseRelations))
+			for _, r := range req.TraverseRelations {
+				clean := strings.TrimSpace(r)
+				if clean != "" {
+					allowedRelations[clean] = struct{}{}
+				}
+			}
+		}
+
+		seedScores := make(map[string]float64, len(seedIDs))
+		for _, id := range seedIDs {
+			if cs, exists := candidates[id]; exists {
+				seedScores[id] = cs.totalScore
+			}
+		}
+
+		rank1Score := 0.0
+		if len(scoredList) > 0 {
+			rank1Score = scoredList[0].totalScore
+		}
+
+		applyNeighbourBoost := func(neighbourID string, seedScore, edgeWeight float64) {
+			nCand, exists := candidates[neighbourID]
+			if !exists {
+				return
+			}
+			if seedScore <= nCand.baseScore {
+				return
+			}
+			boost := delta * math.Min(1.0, edgeWeight) * seedScore
+			newScore := nCand.baseScore + boost + (wAnc * nCand.anchorScore)
+			if nCand.simScore < 0.50 {
+				capScore := seedScore * 0.85
+				if capScore > rank1Score*0.85 {
+					capScore = rank1Score * 0.85
+				}
+				if newScore > capScore {
+					newScore = capScore
+				}
+			} else if (nCand.baseScore < seedScore || nCand.baseScore < rank1Score) && (newScore >= seedScore || newScore >= rank1Score) {
+				limit := seedScore
+				if rank1Score > 0 && rank1Score < limit {
+					limit = rank1Score
+				}
+				newScore = limit * 0.95
+			}
+			if newScore > nCand.totalScore {
+				nCand.totalScore = newScore
+				nCand.hopDistance = 1
+			}
+		}
 
 		for _, edge := range edges {
-			var seedID, neighbourID string
-			seedScore := 0.0
-
-			if cs, isSource := candidates[edge.SourceID]; isSource && cs.hopDistance == 0 {
-				seedID = edge.SourceID
-				neighbourID = edge.TargetID
-				seedScore = cs.totalScore
-			} else if ct, isTarget := candidates[edge.TargetID]; isTarget && ct.hopDistance == 0 {
-				seedID = edge.TargetID
-				neighbourID = edge.SourceID
-				seedScore = ct.totalScore
+			if edge.SourceID == edge.TargetID {
+				continue
 			}
 
-			if seedID != "" && neighbourID != "" && seedID != neighbourID {
-				nCand, exists := candidates[neighbourID]
-				if exists {
-					boost := e.cfg.NeighbourHopBoost * math.Min(1.0, edge.Weight) * seedScore
-					newScore := nCand.baseScore + boost + (wAnc * nCand.anchorScore)
-					if nCand.baseScore < seedScore && newScore >= seedScore {
-						newScore = seedScore * 0.95
-					}
-					if newScore > nCand.totalScore {
-						nCand.totalScore = newScore
-						if nCand.hopDistance == 0 && nCand.simScore < 0.2 {
-							nCand.hopDistance = 1
-						}
-					}
+			// 2. Filter by Edge Weight
+			if edge.Weight < minEdgeWeight {
+				continue
+			}
+
+			// 3. Filter by Relation Type
+			if len(allowedRelations) > 0 {
+				if _, allowed := allowedRelations[edge.RelationType]; !allowed {
+					continue
 				}
+			}
+
+			relevantEdges = append(relevantEdges, edge)
+
+			// 4. Neighbour Attenuation & Displacement Guard
+			if seedScore, isSeed := seedScores[edge.SourceID]; isSeed {
+				applyNeighbourBoost(edge.TargetID, seedScore, edge.Weight)
+			}
+			if seedScore, isSeed := seedScores[edge.TargetID]; isSeed {
+				applyNeighbourBoost(edge.SourceID, seedScore, edge.Weight)
 			}
 		}
 	}

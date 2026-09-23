@@ -248,12 +248,47 @@ type RecallRequest struct {
 	Gamma             float64   `json:"gamma,omitempty"`         // Weight for recency decay (default 0.2)
 	HybridAlpha       *float64  `json:"hybrid_alpha,omitempty"`  // Balance between dense semantic (1.0) and BM25 lexical (0.0), default 0.65
 	Mode              string    `json:"mode,omitempty"`          // "hybrid" | "dense" | "bm25" (default: "hybrid")
-	ExpandHops        int       `json:"expand_hops,omitempty"`   // Graph expansion depth: 0 or 1 (default 1)
+	ExpandNeighbours  *bool     `json:"expand_neighbours,omitempty"` // Explicit toggle (default: false)
+	ExpandHops        int       `json:"expand_hops,omitempty"`       // 0 = direct only, 1 = 1-hop expansion
+	MinEdgeWeight     *float64  `json:"min_edge_weight,omitempty"`   // Minimum edge weight threshold (default: 0.60)
+	TraverseRelations []string  `json:"traverse_relations,omitempty"` // Allowed edge relation types (e.g. ["subgoal_of", "depends_on"])
+	AttenuationFactor *float64  `json:"attenuation_factor,omitempty"` // Neighbour score boost multiplier (default: 0.35)
 	Anchors           []string  `json:"anchors,omitempty"`       // Target anchor tags (e.g. ["#project:kestrel"])
 	AnchorMode        string    `json:"anchor_mode,omitempty"`   // "boost" | "filter" (default: "boost")
 	AnchorWeight      float64   `json:"anchor_weight,omitempty"` // Weight for anchor bonus w_anc (default 1.0)
 	IncludeEmbeddings bool      `json:"include_embeddings,omitempty"`
 	Fields            []string  `json:"fields,omitempty"`
+}
+
+// ShouldExpandNeighbours returns true if ExpandNeighbours is explicitly true,
+// or if ExpandNeighbours == nil and ExpandHops > 0. (Default: false when both are omitted).
+func (r *RecallRequest) ShouldExpandNeighbours() bool {
+	if r.ExpandNeighbours != nil {
+		return *r.ExpandNeighbours
+	}
+	return r.ExpandHops > 0
+}
+
+// GetMinEdgeWeight returns the configured minimum edge weight threshold or default (0.60).
+func (r *RecallRequest) GetMinEdgeWeight(defaultWeight float64) float64 {
+	if r.MinEdgeWeight != nil {
+		return *r.MinEdgeWeight
+	}
+	if defaultWeight > 0 {
+		return defaultWeight
+	}
+	return 0.60
+}
+
+// GetAttenuationFactor returns the configured attenuation factor or default (0.35).
+func (r *RecallRequest) GetAttenuationFactor(defaultAttn float64) float64 {
+	if r.AttenuationFactor != nil {
+		return *r.AttenuationFactor
+	}
+	if defaultAttn > 0 {
+		return defaultAttn
+	}
+	return 0.35
 }
 
 // GetHybridAlpha returns the configured hybrid alpha weight (defaulting to defaultAlpha if nil).
@@ -265,11 +300,12 @@ func (r *RecallRequest) GetHybridAlpha(defaultAlpha float64) float64 {
 }
 
 // UnmarshalJSON implements custom JSON deserialization for RecallRequest
-// to support fields passed as either a JSON array (["id", "label"]) or comma-separated string ("id,label").
+// to support fields and traverse_relations passed as either a JSON array or comma-separated string.
 func (r *RecallRequest) UnmarshalJSON(data []byte) error {
 	type Alias RecallRequest
 	aux := struct {
-		Fields any `json:"fields,omitempty"`
+		Fields            any `json:"fields,omitempty"`
+		TraverseRelations any `json:"traverse_relations,omitempty"`
 		*Alias
 	}{
 		Alias: (*Alias)(r),
@@ -304,6 +340,38 @@ func (r *RecallRequest) UnmarshalJSON(data []byte) error {
 					clean := strings.TrimSpace(f)
 					if clean != "" {
 						r.Fields = append(r.Fields, clean)
+					}
+				}
+			}
+		}
+	}
+
+	if aux.TraverseRelations != nil {
+		switch v := aux.TraverseRelations.(type) {
+		case string:
+			for _, rel := range strings.Split(v, ",") {
+				clean := strings.TrimSpace(rel)
+				if clean != "" {
+					r.TraverseRelations = append(r.TraverseRelations, clean)
+				}
+			}
+		case []any:
+			for _, item := range v {
+				if s, ok := item.(string); ok {
+					for _, rel := range strings.Split(s, ",") {
+						clean := strings.TrimSpace(rel)
+						if clean != "" {
+							r.TraverseRelations = append(r.TraverseRelations, clean)
+						}
+					}
+				}
+			}
+		case []string:
+			for _, s := range v {
+				for _, rel := range strings.Split(s, ",") {
+					clean := strings.TrimSpace(rel)
+					if clean != "" {
+						r.TraverseRelations = append(r.TraverseRelations, clean)
 					}
 				}
 			}
