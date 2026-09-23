@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/model"
+	"github.com/Duara-Cortex/sekha-knowledge-store/internal/security"
 	"modernc.org/sqlite"
 )
 
@@ -27,6 +28,7 @@ func init() {
 type SQLiteStore struct {
 	db     *sql.DB
 	dbPath string
+	cipher security.Cipher
 }
 
 // NewSQLiteStore initialises and verifies the SQLite database schema at the specified path.
@@ -46,9 +48,11 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	db.SetMaxIdleConns(8)
 	db.SetConnMaxLifetime(time.Hour)
 
+	c, _ := security.NewAESGCMCipher("")
 	store := &SQLiteStore{
 		db:     db,
 		dbPath: dbPath,
+		cipher: c,
 	}
 
 	if err := store.initPragmasAndSchema(); err != nil {
@@ -57,6 +61,16 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	}
 
 	return store, nil
+}
+
+// SetCipher configures the encryption cipher used for secret fields.
+func (s *SQLiteStore) SetCipher(cipher security.Cipher) {
+	s.cipher = cipher
+}
+
+// Cipher returns the configured encryption cipher.
+func (s *SQLiteStore) Cipher() security.Cipher {
+	return s.cipher
 }
 
 func (s *SQLiteStore) initPragmasAndSchema() error {
@@ -91,7 +105,8 @@ func (s *SQLiteStore) initPragmasAndSchema() error {
 		access_count INTEGER NOT NULL DEFAULT 0,
 		stability_score REAL NOT NULL DEFAULT 1.0,
 		importance_score REAL NOT NULL DEFAULT 0.5,
-		is_archived INTEGER NOT NULL DEFAULT 0
+		is_archived INTEGER NOT NULL DEFAULT 0,
+		is_secret INTEGER NOT NULL DEFAULT 0
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_nodes_entity_type ON nodes(entity_type);
@@ -150,6 +165,8 @@ func (s *SQLiteStore) initPragmasAndSchema() error {
 		"CREATE INDEX IF NOT EXISTS idx_nodes_importance ON nodes(importance_score);",
 		"CREATE INDEX IF NOT EXISTS idx_nodes_archived ON nodes(is_archived, stability_score);",
 		"ALTER TABLE edges ADD COLUMN last_reinforced_at TIMESTAMP;",
+		"ALTER TABLE nodes ADD COLUMN is_secret INTEGER NOT NULL DEFAULT 0;",
+		"CREATE INDEX IF NOT EXISTS idx_nodes_is_secret ON nodes(is_secret);",
 		`CREATE TABLE IF NOT EXISTS node_anchors (
 			node_id TEXT NOT NULL,
 			anchor_tag TEXT NOT NULL,
@@ -184,8 +201,8 @@ func (s *SQLiteStore) InsertNodes(ctx context.Context, nodes []model.Node) (int,
 	defer func() { _ = tx.Rollback() }()
 
 	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO nodes (id, entity_type, label, summary, embedding, created_at, last_accessed_at, last_reinforced_at, archived_at, access_count, stability_score, importance_score, is_archived)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO nodes (id, entity_type, label, summary, embedding, created_at, last_accessed_at, last_reinforced_at, archived_at, access_count, stability_score, importance_score, is_archived, is_secret)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			entity_type = excluded.entity_type,
 			label = excluded.label,
@@ -196,7 +213,8 @@ func (s *SQLiteStore) InsertNodes(ctx context.Context, nodes []model.Node) (int,
 			last_accessed_at = excluded.last_accessed_at,
 			last_reinforced_at = coalesce(excluded.last_reinforced_at, nodes.last_reinforced_at),
 			archived_at = excluded.archived_at,
-			is_archived = excluded.is_archived
+			is_archived = excluded.is_archived,
+			is_secret = excluded.is_secret
 	`)
 	if err != nil {
 		return 0, err
@@ -216,7 +234,8 @@ func (s *SQLiteStore) InsertNodes(ctx context.Context, nodes []model.Node) (int,
 	now := time.Now().UTC()
 	inserted := 0
 
-	for _, n := range nodes {
+	for i := range nodes {
+		n := &nodes[i]
 		if n.ID == "" {
 			continue
 		}
@@ -237,6 +256,16 @@ func (s *SQLiteStore) InsertNodes(ctx context.Context, nodes []model.Node) (int,
 			importance = 0.5
 		}
 
+		summaryToStore := n.Summary
+		if s.cipher != nil && n.IsSecret && !s.cipher.IsEncrypted(summaryToStore) && !security.IsVaultReference(summaryToStore) {
+			encSummary, err := s.cipher.Encrypt(summaryToStore)
+			if err != nil {
+				return inserted, fmt.Errorf("failed encrypting summary for secret node %s: %w", n.ID, err)
+			}
+			summaryToStore = encSummary
+			n.Summary = encSummary
+		}
+
 		blob := EncodeEmbedding(n.Embedding)
 
 		var reinforcedStr sql.NullString
@@ -254,11 +283,16 @@ func (s *SQLiteStore) InsertNodes(ctx context.Context, nodes []model.Node) (int,
 			isArchivedInt = 1
 		}
 
+		isSecretInt := 0
+		if n.IsSecret {
+			isSecretInt = 1
+		}
+
 		_, err := stmt.ExecContext(ctx,
 			n.ID,
 			n.EntityType,
 			n.Label,
-			n.Summary,
+			summaryToStore,
 			blob,
 			createdAt.Format(time.RFC3339Nano),
 			lastAccessed.Format(time.RFC3339Nano),
@@ -268,6 +302,7 @@ func (s *SQLiteStore) InsertNodes(ctx context.Context, nodes []model.Node) (int,
 			stability,
 			importance,
 			isArchivedInt,
+			isSecretInt,
 		)
 		if err != nil {
 			return inserted, fmt.Errorf("failed inserting node %s: %w", n.ID, err)
@@ -523,7 +558,7 @@ func scanNodeFromRow(row interface{ Scan(dest ...any) error }) (*model.Node, err
 	var blob []byte
 	var createdStr, accessedStr string
 	var reinforcedStr, archivedStr sql.NullString
-	var isArchivedInt int
+	var isArchivedInt, isSecretInt int
 
 	err := row.Scan(
 		&n.ID,
@@ -539,6 +574,7 @@ func scanNodeFromRow(row interface{ Scan(dest ...any) error }) (*model.Node, err
 		&n.StabilityScore,
 		&n.ImportanceScore,
 		&isArchivedInt,
+		&isSecretInt,
 	)
 	if err != nil {
 		return nil, err
@@ -562,6 +598,7 @@ func scanNodeFromRow(row interface{ Scan(dest ...any) error }) (*model.Node, err
 		}
 	}
 	n.IsArchived = isArchivedInt == 1
+	n.IsSecret = isSecretInt == 1
 
 	return &n, nil
 }
@@ -569,7 +606,7 @@ func scanNodeFromRow(row interface{ Scan(dest ...any) error }) (*model.Node, err
 // GetNode retrieves a single node by its ID.
 func (s *SQLiteStore) GetNode(ctx context.Context, id string) (*model.Node, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, entity_type, label, summary, embedding, created_at, last_accessed_at, last_reinforced_at, archived_at, access_count, stability_score, importance_score, is_archived
+		SELECT id, entity_type, label, summary, embedding, created_at, last_accessed_at, last_reinforced_at, archived_at, access_count, stability_score, importance_score, is_archived, is_secret
 		FROM nodes WHERE id = ?
 	`, id)
 
@@ -614,7 +651,7 @@ func (s *SQLiteStore) GetNodes(ctx context.Context, ids []string) (map[string]mo
 		}
 
 		query := fmt.Sprintf(`
-			SELECT id, entity_type, label, summary, embedding, created_at, last_accessed_at, last_reinforced_at, archived_at, access_count, stability_score, importance_score, is_archived
+			SELECT id, entity_type, label, summary, embedding, created_at, last_accessed_at, last_reinforced_at, archived_at, access_count, stability_score, importance_score, is_archived, is_secret
 			FROM nodes WHERE id IN (%s)
 		`, placeholders)
 
@@ -676,7 +713,7 @@ func (s *SQLiteStore) GetAllNodeHeaders(ctx context.Context) ([]NodeHeader, erro
 	}
 
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, entity_type, label, summary, embedding, last_accessed_at, access_count, stability_score, importance_score, is_archived
+		SELECT id, entity_type, label, summary, embedding, last_accessed_at, access_count, stability_score, importance_score, is_archived, is_secret
 		FROM nodes
 		WHERE is_archived = 0
 	`)
@@ -690,7 +727,7 @@ func (s *SQLiteStore) GetAllNodeHeaders(ctx context.Context) ([]NodeHeader, erro
 		var h NodeHeader
 		var blob []byte
 		var accessedStr string
-		var isArchivedInt int
+		var isArchivedInt, isSecretInt int
 
 		if err := rows.Scan(
 			&h.ID,
@@ -703,6 +740,7 @@ func (s *SQLiteStore) GetAllNodeHeaders(ctx context.Context) ([]NodeHeader, erro
 			&h.StabilityScore,
 			&h.ImportanceScore,
 			&isArchivedInt,
+			&isSecretInt,
 		); err != nil {
 			return nil, err
 		}
@@ -719,6 +757,7 @@ func (s *SQLiteStore) GetAllNodeHeaders(ctx context.Context) ([]NodeHeader, erro
 			h.LastAccessedAt = t
 		}
 		h.IsArchived = isArchivedInt == 1
+		h.IsSecret = isSecretInt == 1
 		h.Anchors = anchorsMap[h.ID]
 		headers = append(headers, h)
 	}
@@ -745,7 +784,7 @@ func (s *SQLiteStore) GetAllActiveNodes(ctx context.Context) ([]model.Node, erro
 	}
 
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, entity_type, label, summary, embedding, created_at, last_accessed_at, last_reinforced_at, archived_at, access_count, stability_score, importance_score, is_archived
+		SELECT id, entity_type, label, summary, embedding, created_at, last_accessed_at, last_reinforced_at, archived_at, access_count, stability_score, importance_score, is_archived, is_secret
 		FROM nodes
 		WHERE is_archived = 0
 	`)
@@ -928,7 +967,7 @@ func (s *SQLiteStore) FindMatchingNode(ctx context.Context, label string, entity
 	}
 
 	query := `
-		SELECT id, entity_type, label, summary, embedding, created_at, last_accessed_at, last_reinforced_at, archived_at, access_count, stability_score, importance_score, is_archived
+		SELECT id, entity_type, label, summary, embedding, created_at, last_accessed_at, last_reinforced_at, archived_at, access_count, stability_score, importance_score, is_archived, is_secret
 		FROM nodes
 		WHERE lower(label) = lower(?) AND is_archived = 0
 	`

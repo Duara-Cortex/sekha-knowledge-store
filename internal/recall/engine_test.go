@@ -12,6 +12,7 @@ import (
 
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/embedding"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/model"
+	"github.com/Duara-Cortex/sekha-knowledge-store/internal/security"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/store"
 )
 
@@ -122,6 +123,7 @@ func (m *mockStore) InsertNodes(ctx context.Context, nodes []model.Node) (int, e
 			AccessCount:     n.AccessCount,
 			StabilityScore:  n.StabilityScore,
 			ImportanceScore: n.ImportanceScore,
+			IsSecret:        n.IsSecret,
 			Anchors:         m.anchors[n.ID],
 		})
 	}
@@ -1675,3 +1677,182 @@ func TestFrequencyStarvationProtection(t *testing.T) {
 	t.Logf("Rank 2: %s (Score: %.4f, Imp: %.2f, Freq: %.4f)",
 		resp.Nodes[1].ID, resp.Nodes[1].Score, resp.Nodes[1].ImportanceScore, resp.Nodes[1].FrequencyScore)
 }
+
+func TestRecallEngine_SecretMaskingAndDecryption(t *testing.T) {
+	ctx := context.Background()
+	ms := newMockStore()
+
+	cipher, err := security.NewAESGCMCipher("recall-test-master-key-32b")
+	if err != nil {
+		t.Fatalf("failed to create cipher: %v", err)
+	}
+
+	secretPlain := "API_KEY=hvb_live_999 secret_token"
+	encSecret, err := cipher.Encrypt(secretPlain)
+	if err != nil {
+		t.Fatalf("failed to encrypt secret: %v", err)
+	}
+
+	vaultRef := "vault://secrets/kestrel-api-key"
+	publicPlain := "Public configuration parameter: timeout=30s"
+
+	now := time.Now().UTC()
+	nodes := []model.Node{
+		{
+			ID:              "node-secret",
+			EntityType:      "credential",
+			Label:           "Kestrel Database API Key",
+			Summary:         encSecret,
+			IsSecret:        true,
+			Embedding:       embedding.Generate("Kestrel Database API Key", model.DefaultVectorDim),
+			CreatedAt:       now,
+			LastAccessedAt:  now,
+			StabilityScore:  1.0,
+			ImportanceScore: 0.8,
+		},
+		{
+			ID:              "node-vault",
+			EntityType:      "credential",
+			Label:           "Kestrel Vault Secret Reference",
+			Summary:         vaultRef,
+			IsSecret:        true,
+			Embedding:       embedding.Generate("Kestrel Vault Secret Reference", model.DefaultVectorDim),
+			CreatedAt:       now,
+			LastAccessedAt:  now,
+			StabilityScore:  1.0,
+			ImportanceScore: 0.8,
+		},
+		{
+			ID:              "node-public",
+			EntityType:      "config",
+			Label:           "Kestrel Network Timeout Config",
+			Summary:         publicPlain,
+			IsSecret:        false,
+			Embedding:       embedding.Generate("Kestrel Network Timeout Config", model.DefaultVectorDim),
+			CreatedAt:       now,
+			LastAccessedAt:  now,
+			StabilityScore:  1.0,
+			ImportanceScore: 0.5,
+		},
+	}
+
+	_, err = ms.InsertNodes(ctx, nodes)
+	if err != nil {
+		t.Fatalf("InsertNodes failed: %v", err)
+	}
+
+	cfg := DefaultConfig()
+	cfg.Cipher = cipher
+	engine, err := NewEngine(ctx, ms, cfg)
+	if err != nil {
+		t.Fatalf("NewEngine failed: %v", err)
+	}
+
+	// 1. Recall with IncludeSecrets: false (default safe behavior)
+	respRedacted, err := engine.Recall(ctx, model.RecallRequest{
+		Query:          "Kestrel Database API Key",
+		TopK:           3,
+		IncludeSecrets: false,
+	})
+	if err != nil {
+		t.Fatalf("Recall failed: %v", err)
+	}
+
+	var foundSecret, foundVault, foundPublic *model.ScoredNode
+	for i := range respRedacted.Nodes {
+		switch respRedacted.Nodes[i].ID {
+		case "node-secret":
+			foundSecret = &respRedacted.Nodes[i]
+		case "node-vault":
+			foundVault = &respRedacted.Nodes[i]
+		case "node-public":
+			foundPublic = &respRedacted.Nodes[i]
+		}
+	}
+
+	if foundSecret == nil {
+		t.Fatalf("expected node-secret in recall results")
+	}
+	if !foundSecret.IsSecret {
+		t.Errorf("expected foundSecret.IsSecret to be true")
+	}
+	if foundSecret.Summary != "[REDACTED_SECRET]" {
+		t.Errorf("expected redacted summary '[REDACTED_SECRET]', got %q", foundSecret.Summary)
+	}
+
+	if foundVault == nil {
+		t.Fatalf("expected node-vault in recall results")
+	}
+	if !foundVault.IsSecret {
+		t.Errorf("expected foundVault.IsSecret to be true")
+	}
+	if foundVault.Summary != "[REDACTED_SECRET]" {
+		t.Errorf("expected vault node summary to be masked as '[REDACTED_SECRET]', got %q", foundVault.Summary)
+	}
+
+	if foundPublic == nil {
+		t.Fatalf("expected node-public in recall results")
+	}
+	if foundPublic.IsSecret {
+		t.Errorf("expected foundPublic.IsSecret to be false")
+	}
+	if foundPublic.Summary != publicPlain {
+		t.Errorf("expected public node summary to be unchanged, got %q", foundPublic.Summary)
+	}
+
+	// 2. Recall with IncludeSecrets: true
+	respPlain, err := engine.Recall(ctx, model.RecallRequest{
+		Query:          "Kestrel Database API Key",
+		TopK:           3,
+		IncludeSecrets: true,
+	})
+	if err != nil {
+		t.Fatalf("Recall with IncludeSecrets failed: %v", err)
+	}
+
+	var plainSecret, plainVault *model.ScoredNode
+	for i := range respPlain.Nodes {
+		switch respPlain.Nodes[i].ID {
+		case "node-secret":
+			plainSecret = &respPlain.Nodes[i]
+		case "node-vault":
+			plainVault = &respPlain.Nodes[i]
+		}
+	}
+
+	if plainSecret == nil {
+		t.Fatalf("expected node-secret in plain recall results")
+	}
+	if plainSecret.Summary != secretPlain {
+		t.Errorf("expected decrypted plaintext %q, got %q", secretPlain, plainSecret.Summary)
+	}
+
+	if plainVault == nil {
+		t.Fatalf("expected node-vault in plain recall results")
+	}
+	if plainVault.Summary != vaultRef {
+		t.Errorf("expected vault reference %q preserved cleanly, got %q", vaultRef, plainVault.Summary)
+	}
+
+	// 3. Test Projection with is_secret and summary
+	respProj, err := engine.Recall(ctx, model.RecallRequest{
+		Query:          "Kestrel Database API Key",
+		TopK:           1,
+		IncludeSecrets: false,
+		Fields:         []string{"id", "summary", "is_secret"},
+	})
+	if err != nil {
+		t.Fatalf("Recall with projection failed: %v", err)
+	}
+	if len(respProj.ProjectedNodes) == 0 {
+		t.Fatalf("expected projected nodes")
+	}
+	proj := respProj.ProjectedNodes[0]
+	if proj["summary"] != "[REDACTED_SECRET]" {
+		t.Errorf("expected projected summary to be '[REDACTED_SECRET]', got: %v", proj["summary"])
+	}
+	if proj["is_secret"] != true {
+		t.Errorf("expected projected is_secret to be true, got: %v", proj["is_secret"])
+	}
+}
+

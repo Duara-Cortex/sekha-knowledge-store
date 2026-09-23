@@ -28,6 +28,7 @@ type Node struct {
 	StabilityScore   float64    `json:"stability_score"`
 	ImportanceScore  float64    `json:"importance_score"`
 	IsArchived       bool       `json:"is_archived"`
+	IsSecret         bool       `json:"is_secret,omitempty"`
 }
 
 // NormalizeAnchor ensures anchor tags are lowercase, trimmed, and prefixed with '#'
@@ -65,6 +66,7 @@ type ScoredNode struct {
 	ImportanceScore float64  `json:"importance_score"`
 	AnchorScore     float64  `json:"anchor_score,omitempty"`
 	HopDistance     int      `json:"hop_distance"`
+	IsSecret        bool     `json:"is_secret,omitempty"`
 }
 
 // MarshalJSON customises JSON serialisation for ScoredNode using ScoredNodeDTO to omit nil embeddings and prune schemas.
@@ -80,7 +82,15 @@ func (sn *ScoredNode) UnmarshalJSON(data []byte) error {
 	}{
 		Alias: (*Alias)(sn),
 	}
-	return json.Unmarshal(data, &aux)
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if sn.Node.IsSecret && !sn.IsSecret {
+		sn.IsSecret = true
+	} else if sn.IsSecret && !sn.Node.IsSecret {
+		sn.Node.IsSecret = true
+	}
+	return nil
 }
 
 // ScoredNodeDTO is a serialisable representation of ScoredNode supporting projection and embedding omission.
@@ -100,6 +110,7 @@ type ScoredNodeDTO struct {
 	StabilityScore   *float64   `json:"stability_score,omitempty"`
 	ImportanceScore  *float64   `json:"importance_score,omitempty"`
 	IsArchived       *bool      `json:"is_archived,omitempty"`
+	IsSecret         *bool      `json:"is_secret,omitempty"`
 	SimScore         *float64   `json:"sim_score,omitempty"`
 	DenseScore       *float64   `json:"dense_score,omitempty"`
 	BM25Score        *float64   `json:"bm25_score,omitempty"`
@@ -157,6 +168,10 @@ func (sn ScoredNode) ToDTO(includeEmbeddings bool) ScoredNodeDTO {
 	if sn.HopDistance > 0 {
 		dto.HopDistance = &sn.HopDistance
 	}
+	if sn.IsSecret || sn.Node.IsSecret {
+		b := true
+		dto.IsSecret = &b
+	}
 	if !sn.LastReinforcedAt.IsZero() {
 		dto.LastReinforcedAt = &sn.LastReinforcedAt
 	}
@@ -206,6 +221,8 @@ func (sn ScoredNode) Project(fields []string) map[string]any {
 			out["stability_score"] = sn.StabilityScore
 		case "is_archived":
 			out["is_archived"] = sn.IsArchived
+		case "is_secret":
+			out["is_secret"] = sn.IsSecret || sn.Node.IsSecret
 		case "score":
 			out["score"] = sn.Score
 		case "sim_score":
@@ -272,6 +289,7 @@ type RecallRequest struct {
 	AnchorMode        string    `json:"anchor_mode,omitempty"`        // "boost" | "filter" (default: "boost")
 	AnchorWeight      float64   `json:"anchor_weight,omitempty"`      // Weight for anchor bonus w_anc (default 1.0)
 	IncludeEmbeddings bool      `json:"include_embeddings,omitempty"`
+	IncludeSecrets    bool      `json:"include_secrets,omitempty"`
 	Fields            []string  `json:"fields,omitempty"`
 }
 

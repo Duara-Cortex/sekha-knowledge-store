@@ -31,6 +31,7 @@ type Config struct {
 	URL       string        // SEKHA_EMBEDDING_URL
 	Dimension int           // SEKHA_EMBEDDING_DIM (default: 384)
 	Timeout   time.Duration // SEKHA_EMBEDDING_TIMEOUT_MS (default: 500ms)
+	APIKey    string        // SEKHA_EMBEDDING_API_KEY (fallback to SEKHA_API_KEY)
 }
 
 // DefaultConfig returns the default configuration when embedding is disabled.
@@ -40,6 +41,7 @@ func DefaultConfig() Config {
 		URL:       "",
 		Dimension: model.DefaultVectorDim, // 384
 		Timeout:   500 * time.Millisecond,
+		APIKey:    "",
 	}
 }
 
@@ -127,6 +129,12 @@ func ConfigFromEnv() Config {
 			cfg.Timeout = time.Duration(ms) * time.Millisecond
 		}
 	}
+
+	apiKey := strings.TrimSpace(os.Getenv("SEKHA_EMBEDDING_API_KEY"))
+	if apiKey == "" {
+		apiKey = strings.TrimSpace(os.Getenv("SEKHA_API_KEY"))
+	}
+	cfg.APIKey = apiKey
 
 	return cfg
 }
@@ -227,6 +235,11 @@ func (c *Client) Fallback() Embedder {
 	return c.fallback
 }
 
+// APIKey returns the configured API key (if any).
+func (c *Client) APIKey() string {
+	return c.cfg.APIKey
+}
+
 // EmbedText generates a dense vector embedding for a single string.
 func (c *Client) EmbedText(ctx context.Context, text string) ([]float32, error) {
 	if !c.cfg.Enabled || c.endpoint == "" {
@@ -305,6 +318,9 @@ func (c *Client) embedHTTP(ctx context.Context, input any) ([][]float32, error) 
 		return nil, fmt.Errorf("failed creating embedding http request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if c.cfg.APIKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+	}
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {

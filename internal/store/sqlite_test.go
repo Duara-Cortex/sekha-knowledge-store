@@ -1,13 +1,16 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/model"
+	"github.com/Duara-Cortex/sekha-knowledge-store/internal/security"
 )
 
 func newTestSQLiteStore(t *testing.T) *SQLiteStore {
@@ -533,3 +536,133 @@ func TestSQLiteStore_ApplyScopedDecay(t *testing.T) {
 		t.Errorf("expected edge connected to distractor-1 to be pruned, got %d", prunedEdges)
 	}
 }
+
+func TestSQLiteStore_EncryptionAtRestAndSecretNodes(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "encrypted_test.db")
+
+	s, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("failed to create sqlite store: %v", err)
+	}
+	defer s.Close()
+
+	c, err := security.NewAESGCMCipher("test-custom-master-key-xyz")
+	if err != nil {
+		t.Fatalf("failed to create cipher: %v", err)
+	}
+	s.SetCipher(c)
+
+	secretPlaintext := "API_KEY=hvb_live_999 secret_token"
+	secretNode := model.Node{
+		ID:         "node-secret-1",
+		EntityType: "credential",
+		Label:      "HVB Live API Key",
+		Summary:    secretPlaintext,
+		IsSecret:   true,
+	}
+
+	vaultRef := "vault://secrets/kestrel-api-key"
+	vaultNode := model.Node{
+		ID:         "node-vault-1",
+		EntityType: "credential",
+		Label:      "Vault Ref Key",
+		Summary:    vaultRef,
+		IsSecret:   true,
+	}
+
+	regularNode := model.Node{
+		ID:         "node-regular-1",
+		EntityType: "documentation",
+		Label:      "Public Readme",
+		Summary:    "This is unencrypted documentation summary",
+		IsSecret:   false,
+	}
+
+	_, err = s.InsertNodes(ctx, []model.Node{secretNode, vaultNode, regularNode})
+	if err != nil {
+		t.Fatalf("InsertNodes failed: %v", err)
+	}
+
+	// 1. Direct SQLite table query inspection
+	var storedSummary string
+	var isSecretInt int
+	err = s.db.QueryRowContext(ctx, "SELECT summary, is_secret FROM nodes WHERE id = ?", secretNode.ID).Scan(&storedSummary, &isSecretInt)
+	if err != nil {
+		t.Fatalf("querying secret node directly failed: %v", err)
+	}
+
+	if isSecretInt != 1 {
+		t.Errorf("expected is_secret = 1 in database, got: %d", isSecretInt)
+	}
+	if !strings.HasPrefix(storedSummary, "enc:v1:") {
+		t.Errorf("expected stored summary to start with 'enc:v1:', got: %s", storedSummary)
+	}
+	if strings.Contains(storedSummary, "hvb_live_999") {
+		t.Errorf("plaintext leaked in stored database summary: %s", storedSummary)
+	}
+
+	// 2. Direct inspection of vault reference in database
+	var storedVaultSummary string
+	var vaultIsSecretInt int
+	err = s.db.QueryRowContext(ctx, "SELECT summary, is_secret FROM nodes WHERE id = ?", vaultNode.ID).Scan(&storedVaultSummary, &vaultIsSecretInt)
+	if err != nil {
+		t.Fatalf("querying vault node directly failed: %v", err)
+	}
+	if vaultIsSecretInt != 1 {
+		t.Errorf("expected is_secret = 1 for vault node, got: %d", vaultIsSecretInt)
+	}
+	if storedVaultSummary != vaultRef {
+		t.Errorf("vault reference altered in database; want %s, got %s", vaultRef, storedVaultSummary)
+	}
+
+	// 3. Inspect raw database file on disk to guarantee zero plaintext persistence
+	// Force a checkpoint to flush WAL to main database file or read both
+	_, _ = s.db.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE);")
+
+	dbFiles, _ := filepath.Glob(filepath.Join(dir, "*"))
+	for _, f := range dbFiles {
+		bytesContent, err := os.ReadFile(f)
+		if err == nil {
+			if bytes.Contains(bytesContent, []byte("hvb_live_999")) {
+				t.Fatalf("SECURITY VIOLATION: plaintext 'hvb_live_999' found on disk in %s", f)
+			}
+		}
+	}
+
+	// 4. Test GetNode and GetNodes keep ciphertext
+	gn, err := s.GetNode(ctx, secretNode.ID)
+	if err != nil {
+		t.Fatalf("GetNode failed: %v", err)
+	}
+	if gn == nil {
+		t.Fatalf("GetNode returned nil")
+	}
+	if !gn.IsSecret {
+		t.Errorf("expected gn.IsSecret to be true")
+	}
+	if !strings.HasPrefix(gn.Summary, "enc:v1:") {
+		t.Errorf("expected gn.Summary to remain ciphertext in store retrieval, got: %s", gn.Summary)
+	}
+
+	// 5. Test GetAllNodeHeaders populates IsSecret
+	headers, err := s.GetAllNodeHeaders(ctx)
+	if err != nil {
+		t.Fatalf("GetAllNodeHeaders failed: %v", err)
+	}
+	headerMap := make(map[string]NodeHeader)
+	for _, h := range headers {
+		headerMap[h.ID] = h
+	}
+	if !headerMap[secretNode.ID].IsSecret {
+		t.Errorf("expected header for secret node to have IsSecret = true")
+	}
+	if !headerMap[vaultNode.ID].IsSecret {
+		t.Errorf("expected header for vault node to have IsSecret = true")
+	}
+	if headerMap[regularNode.ID].IsSecret {
+		t.Errorf("expected header for regular node to have IsSecret = false")
+	}
+}
+

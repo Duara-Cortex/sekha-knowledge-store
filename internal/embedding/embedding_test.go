@@ -315,3 +315,76 @@ func TestConfigFromEnv_DefaultDisabled(t *testing.T) {
 		t.Fatalf("expected client health Status=offline, got %s", health.Status)
 	}
 }
+
+func TestConfigFromEnv_APIKeyHandling(t *testing.T) {
+	// Case 1: SEKHA_EMBEDDING_API_KEY explicitly set
+	os.Setenv("SEKHA_EMBEDDING_API_KEY", "embed-key-123")
+	os.Setenv("SEKHA_API_KEY", "cluster-key-456")
+	cfg1 := ConfigFromEnv()
+	if cfg1.APIKey != "embed-key-123" {
+		t.Errorf("expected APIKey to be 'embed-key-123', got '%s'", cfg1.APIKey)
+	}
+
+	// Case 2: SEKHA_EMBEDDING_API_KEY unset, fall back to SEKHA_API_KEY
+	os.Unsetenv("SEKHA_EMBEDDING_API_KEY")
+	cfg2 := ConfigFromEnv()
+	if cfg2.APIKey != "cluster-key-456" {
+		t.Errorf("expected APIKey fallback to 'cluster-key-456', got '%s'", cfg2.APIKey)
+	}
+
+	// Case 3: Both unset
+	os.Unsetenv("SEKHA_API_KEY")
+	cfg3 := ConfigFromEnv()
+	if cfg3.APIKey != "" {
+		t.Errorf("expected empty APIKey, got '%s'", cfg3.APIKey)
+	}
+}
+
+func TestClient_AuthorizationHeaderAttached(t *testing.T) {
+	var capturedAuthHeader string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedAuthHeader = r.Header.Get("Authorization")
+		_ = json.NewEncoder(w).Encode(openAIEmbeddingResponse{
+			Data: []openAIEmbeddingItem{
+				{Index: 0, Embedding: make([]float32, 384)},
+			},
+		})
+	}))
+	defer server.Close()
+
+	// With API key
+	cfgWithKey := Config{
+		Enabled:   true,
+		URL:       server.URL,
+		Dimension: 384,
+		Timeout:   2 * time.Second,
+		APIKey:    "test-secret-bearer-token",
+	}
+	clientWithKey := NewClient(cfgWithKey, nil)
+	_, err := clientWithKey.EmbedText(context.Background(), "hello world")
+	if err != nil {
+		t.Fatalf("EmbedText failed: %v", err)
+	}
+	if capturedAuthHeader != "Bearer test-secret-bearer-token" {
+		t.Errorf("expected 'Bearer test-secret-bearer-token', got '%s'", capturedAuthHeader)
+	}
+
+	// Without API key
+	capturedAuthHeader = ""
+	cfgWithoutKey := Config{
+		Enabled:   true,
+		URL:       server.URL,
+		Dimension: 384,
+		Timeout:   2 * time.Second,
+		APIKey:    "",
+	}
+	clientWithoutKey := NewClient(cfgWithoutKey, nil)
+	_, err = clientWithoutKey.EmbedText(context.Background(), "hello world")
+	if err != nil {
+		t.Fatalf("EmbedText without key failed: %v", err)
+	}
+	if capturedAuthHeader != "" {
+		t.Errorf("expected empty Authorization header, got '%s'", capturedAuthHeader)
+	}
+}
+
