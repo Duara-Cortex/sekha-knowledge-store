@@ -6,6 +6,12 @@ import (
 	"time"
 )
 
+// DefaultVectorDim specifies standard dense semantic vector dimensionality (all-MiniLM-L6-v2 384-D).
+const DefaultVectorDim = 384
+
+// LegacyVectorDim specifies legacy prototype SHA-256 token hash projection dimensionality.
+const LegacyVectorDim = 64
+
 // Node represents a vertex in the relational knowledge graph.
 type Node struct {
 	ID               string     `json:"id"`
@@ -49,12 +55,14 @@ type Edge struct {
 // ScoredNode wraps a Node with the associative recall score breakdown.
 type ScoredNode struct {
 	Node
-	Score          float64 `json:"score"`
-	SimScore       float64 `json:"sim_score"`
-	FrequencyScore float64 `json:"frequency_score"`
-	RecencyScore   float64 `json:"recency_score"`
-	AnchorScore    float64 `json:"anchor_score,omitempty"`
-	HopDistance    int     `json:"hop_distance"`
+	Score          float64  `json:"score"`
+	SimScore       float64  `json:"sim_score"`
+	DenseScore     *float64 `json:"dense_score,omitempty"`
+	BM25Score      *float64 `json:"bm25_score,omitempty"`
+	FrequencyScore float64  `json:"frequency_score"`
+	RecencyScore   float64  `json:"recency_score"`
+	AnchorScore    float64  `json:"anchor_score,omitempty"`
+	HopDistance    int      `json:"hop_distance"`
 }
 
 // MarshalJSON customises JSON serialisation for ScoredNode using ScoredNodeDTO to omit nil embeddings and prune schemas.
@@ -90,6 +98,8 @@ type ScoredNodeDTO struct {
 	StabilityScore   *float64   `json:"stability_score,omitempty"`
 	IsArchived       *bool      `json:"is_archived,omitempty"`
 	SimScore         *float64   `json:"sim_score,omitempty"`
+	DenseScore       *float64   `json:"dense_score,omitempty"`
+	BM25Score        *float64   `json:"bm25_score,omitempty"`
 	FrequencyScore   *float64   `json:"frequency_score,omitempty"`
 	RecencyScore     *float64   `json:"recency_score,omitempty"`
 	AnchorScore      *float64   `json:"anchor_score,omitempty"`
@@ -120,6 +130,12 @@ func (sn ScoredNode) ToDTO(includeEmbeddings bool) ScoredNodeDTO {
 	}
 	if sn.SimScore > 0 {
 		dto.SimScore = &sn.SimScore
+	}
+	if sn.DenseScore != nil {
+		dto.DenseScore = sn.DenseScore
+	}
+	if sn.BM25Score != nil {
+		dto.BM25Score = sn.BM25Score
 	}
 	if sn.FrequencyScore > 0 {
 		dto.FrequencyScore = &sn.FrequencyScore
@@ -186,6 +202,14 @@ func (sn ScoredNode) Project(fields []string) map[string]any {
 			out["score"] = sn.Score
 		case "sim_score":
 			out["sim_score"] = sn.SimScore
+		case "dense_score":
+			if sn.DenseScore != nil {
+				out["dense_score"] = *sn.DenseScore
+			}
+		case "bm25_score":
+			if sn.BM25Score != nil {
+				out["bm25_score"] = *sn.BM25Score
+			}
 		case "frequency_score":
 			out["frequency_score"] = sn.FrequencyScore
 		case "recency_score":
@@ -222,12 +246,22 @@ type RecallRequest struct {
 	Alpha             float64   `json:"alpha,omitempty"`         // Weight for semantic similarity (default 0.6)
 	Beta              float64   `json:"beta,omitempty"`          // Weight for access count frequency (default 0.2)
 	Gamma             float64   `json:"gamma,omitempty"`         // Weight for recency decay (default 0.2)
+	HybridAlpha       *float64  `json:"hybrid_alpha,omitempty"`  // Balance between dense semantic (1.0) and BM25 lexical (0.0), default 0.65
+	Mode              string    `json:"mode,omitempty"`          // "hybrid" | "dense" | "bm25" (default: "hybrid")
 	ExpandHops        int       `json:"expand_hops,omitempty"`   // Graph expansion depth: 0 or 1 (default 1)
 	Anchors           []string  `json:"anchors,omitempty"`       // Target anchor tags (e.g. ["#project:kestrel"])
 	AnchorMode        string    `json:"anchor_mode,omitempty"`   // "boost" | "filter" (default: "boost")
 	AnchorWeight      float64   `json:"anchor_weight,omitempty"` // Weight for anchor bonus w_anc (default 1.0)
 	IncludeEmbeddings bool      `json:"include_embeddings,omitempty"`
 	Fields            []string  `json:"fields,omitempty"`
+}
+
+// GetHybridAlpha returns the configured hybrid alpha weight (defaulting to defaultAlpha if nil).
+func (r *RecallRequest) GetHybridAlpha(defaultAlpha float64) float64 {
+	if r.HybridAlpha != nil {
+		return *r.HybridAlpha
+	}
+	return defaultAlpha
 }
 
 // UnmarshalJSON implements custom JSON deserialization for RecallRequest
@@ -281,7 +315,7 @@ func (r *RecallRequest) UnmarshalJSON(data []byte) error {
 // RecallResponse returns ranked contextual nodes and their relational subgraph.
 type RecallResponse struct {
 	Nodes          []ScoredNode     `json:"nodes"`
-	Edges          []Edge           `json:"edges"`
+	Edges          []Edge           `json:"edges,omitempty"`
 	QueryLatencyMS float64          `json:"query_latency_ms"`
 	ProjectedNodes []map[string]any `json:"-"`
 }
@@ -312,13 +346,22 @@ type GraphSummary struct {
 	DBSizeBytes  int64            `json:"db_size_bytes"`
 }
 
+// EmbeddingEngineHealth reports status and configuration of the dense semantic embedding client.
+type EmbeddingEngineHealth struct {
+	Enabled   bool   `json:"enabled"`
+	Status    string `json:"status"` // "reachable", "degraded", "offline"
+	URL       string `json:"url"`
+	Dimension int    `json:"dimension"`
+}
+
 // HealthResponse reports service status and cluster node metadata.
 type HealthResponse struct {
-	Status        string `json:"status"`
-	Node          string `json:"node"`
-	Port          int    `json:"port"`
-	Service       string `json:"service"`
-	UptimeSeconds int64  `json:"uptime_seconds"`
-	NodeCount     int64  `json:"node_count"`
-	EdgeCount     int64  `json:"edge_count"`
+	Status          string                 `json:"status"`
+	Node            string                 `json:"node,omitempty"`
+	Port            int                    `json:"port,omitempty"`
+	Service         string                 `json:"service,omitempty"`
+	UptimeSeconds   int64                  `json:"uptime_seconds,omitempty"`
+	NodeCount       int64                  `json:"node_count"`
+	EdgeCount       int64                  `json:"edge_count"`
+	EmbeddingEngine *EmbeddingEngineHealth `json:"embedding_engine,omitempty"`
 }

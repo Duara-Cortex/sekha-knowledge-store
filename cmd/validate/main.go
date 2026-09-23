@@ -10,6 +10,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/Duara-Cortex/sekha-knowledge-store/internal/embedding"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/model"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/recall"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/store"
@@ -18,7 +19,7 @@ import (
 func main() {
 	nodeCount := flag.Int("nodes", 10000, "Number of synthetic knowledge nodes to generate")
 	edgeCount := flag.Int("edges", 25000, "Number of synthetic relational edges to generate")
-	dimensions := flag.Int("dims", 64, "Embedding vector dimensionality")
+	dimensions := flag.Int("dims", model.DefaultVectorDim, "Embedding vector dimensionality (default 384-D)")
 	queries := flag.Int("queries", 100, "Number of test recall queries to execute")
 	dbPath := flag.String("db", "test_benchmark.db", "Temporary SQLite database path for benchmark")
 	flag.Parse()
@@ -70,7 +71,6 @@ func main() {
 		for d := 0; d < *dimensions; d++ {
 			vec[d] = float32(rng.NormFloat64())
 		}
-		// Normalise vector to unit length
 		var sum float64
 		for _, v := range vec {
 			sum += float64(v * v)
@@ -82,7 +82,7 @@ func main() {
 			}
 		}
 
-		elapsedHours := rng.Float64() * 720.0 // up to 30 days old
+		elapsedHours := rng.Float64() * 720.0
 		lastAccessed := now.Add(-time.Duration(elapsedHours * float64(time.Hour)))
 		created := lastAccessed.Add(-time.Duration(rng.Float64() * 100.0 * float64(time.Hour)))
 		accessCount := int64(rng.Intn(150))
@@ -140,14 +140,21 @@ func main() {
 	fmt.Printf("         Inserted %d edges in %.2fs\n", *edgeCount, time.Since(edgeStart).Seconds())
 
 	// 3. Hydrate in-memory associative recall engine
-	fmt.Println("[Step 3] Initialising in-memory associative recall engine...")
+	fmt.Println("[Step 3] Initialising and hydrating in-memory associative recall engine...")
 	hydrateStart := time.Now()
-	engine, err := recall.NewEngine(ctx, sqliteStore, recall.DefaultConfig())
+	engineCfg := recall.DefaultConfig()
+	engineCfg.Embedder = embedding.NewMockEmbedder(*dimensions)
+	engine, err := recall.NewEngine(ctx, sqliteStore, engineCfg)
 	if err != nil {
 		fmt.Printf("[FATAL] Failed to initialise recall engine: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("         Hydrated index for %d nodes in %.2fms\n", *nodeCount, float64(time.Since(hydrateStart).Microseconds())/1000.0)
+	hydrateMS := float64(time.Since(hydrateStart).Microseconds()) / 1000.0
+	fmt.Printf("         Hydrated index for %d nodes in %.2f ms (Target: < 150.0 ms)\n", *nodeCount, hydrateMS)
+	if hydrateMS >= 150.0 {
+		fmt.Printf("[FATAL] Hydration latency exceeded 150 ms threshold: %.2f ms\n", hydrateMS)
+		os.Exit(1)
+	}
 
 	// 4. Graph Summary Check
 	summary, err := sqliteStore.GetGraphSummary(ctx)
@@ -165,7 +172,6 @@ func main() {
 	var totalLatency float64
 
 	for q := 0; q < *queries; q++ {
-		// Generate random query vector
 		qVec := make([]float32, *dimensions)
 		for d := 0; d < *dimensions; d++ {
 			qVec[d] = float32(rng.NormFloat64())
@@ -213,13 +219,14 @@ func main() {
 	maxLat := latencies[len(latencies)-1]
 	minLat := latencies[0]
 
-	targetLatency := 20.0 // Target is < 20ms per Task 08 requirements
+	targetLatency := 15.0 // Target is < 15.0 ms per acceptance criteria
 
 	fmt.Println("----------------------------------------------------------------")
 	fmt.Println("                    EMPIRICAL BENCHMARK RESULTS                 ")
 	fmt.Println("----------------------------------------------------------------")
 	fmt.Printf(" Total Synthetic Nodes: %d\n", *nodeCount)
 	fmt.Printf(" Total Relational Edges: %d\n", *edgeCount)
+	fmt.Printf(" Hydration Latency:     %.3f ms (Target: < 150.0 ms)\n", hydrateMS)
 	fmt.Printf(" Mean Recall Latency:   %.3f ms (Target: < %.1f ms)\n", mean, targetLatency)
 	fmt.Printf(" Median (p50) Latency:  %.3f ms\n", p50)
 	fmt.Printf(" 90th Percentile (p90): %.3f ms\n", p90)
@@ -230,13 +237,13 @@ func main() {
 
 	if p95 < targetLatency && mean < targetLatency {
 		fmt.Printf(" RESULT: PASS - Associative recall latency on %d nodes\n", *nodeCount)
-		fmt.Printf(" satisfies the sub-20ms requirement by a factor of %.1fx!\n", targetLatency/mean)
+		fmt.Printf(" satisfies the sub-15ms requirement by a factor of %.1fx!\n", targetLatency/mean)
 	} else {
 		fmt.Printf(" RESULT: FAIL - Recall latency exceeded %.1fms threshold\n", targetLatency)
 		os.Exit(1)
 	}
 
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
 
 	// 6. Multi-Project Anchor Recall Benchmark
 	fmt.Println("\n[Step 5] Multi-Project Anchor Benchmark (Eliminating Generic Token Dilution)...")
@@ -329,16 +336,120 @@ func main() {
 	fmt.Printf(" Multi-Project Nodes:   %d (3 projects, overlapping generic tokens)\n", len(anchorNodes))
 	fmt.Printf(" Benchmark Queries:     %d iterations\n", anchorQueries)
 	fmt.Printf(" Target Rank 1 Hit:     %.1f%% (Target: >= 90.0%%)\n", hitRate)
-	fmt.Printf(" Mean Query Latency:    %.3f ms (Target: < 20.0 ms)\n", anchorMean)
-	fmt.Printf(" 95th Percentile (p95): %.3f ms (Target: < 20.0 ms)\n", anchorP95)
+	fmt.Printf(" Mean Query Latency:    %.3f ms (Target: < 15.0 ms)\n", anchorMean)
+	fmt.Printf(" 95th Percentile (p95): %.3f ms (Target: < 15.0 ms)\n", anchorP95)
 	fmt.Println("----------------------------------------------------------------")
 
 	if hitRate >= 90.0 && anchorP95 < targetLatency {
 		fmt.Println(" RESULT: PASS - Multi-project anchor tags eliminate ranking dilution")
-		fmt.Println(" with >= 90% Rank 1 precision and sub-20ms edge query latency!")
+		fmt.Println(" with >= 90% Rank 1 precision and sub-15ms edge query latency!")
 	} else {
 		fmt.Printf(" RESULT: FAIL - Anchor benchmark did not satisfy requirements (Hit Rate: %.1f%%, p95: %.3fms)\n", hitRate, anchorP95)
 		os.Exit(1)
 	}
+
+	// 7. Acceptance Criteria Verification
+	fmt.Println("\n[Step 6] Verifying Acceptance Criteria (Semantic Paraphrasing, Lexical Fidelity, Noise Floor)...")
+
+	// Ingest acceptance criteria nodes
+	acNodes := []model.Node{
+		{
+			ID:             "ac-node-consensus",
+			EntityType:     "decision",
+			Label:          "Cluster Consensus Settings",
+			Summary:        "consensus heartbeat timeout configured to 500ms for health checks",
+			CreatedAt:      now,
+			LastAccessedAt: now,
+			AccessCount:    20,
+			StabilityScore: 1.0,
+		},
+		{
+			ID:             "ac-node-nginx",
+			EntityType:     "procedure",
+			Label:          "Web Server Concurrency",
+			Summary:        "Set worker_connections 4096 in nginx core events configuration",
+			CreatedAt:      now,
+			LastAccessedAt: now,
+			AccessCount:    20,
+			StabilityScore: 1.0,
+		},
+		{
+			ID:             "ac-node-port",
+			EntityType:     "decision",
+			Label:          "Memory Service Daemon",
+			Summary:        "Sekha knowledge graph API listening on port 8084",
+			CreatedAt:      now,
+			LastAccessedAt: now,
+			AccessCount:    20,
+			StabilityScore: 1.0,
+		},
+	}
+
+	if _, err := sqliteStore.InsertNodes(ctx, acNodes); err != nil {
+		fmt.Printf("[FATAL] Error inserting acceptance criteria nodes: %v\n", err)
+		os.Exit(1)
+	}
+	engine.RegisterNodes(acNodes)
+
+	// Verification 1: Semantic Paraphrasing
+	paraResp, err := engine.Recall(ctx, model.RecallRequest{
+		Query: "cluster coordination interval",
+		TopK:  3,
+	})
+	if err != nil || len(paraResp.Nodes) == 0 {
+		fmt.Printf("[FATAL] Semantic paraphrase recall query failed: %v\n", err)
+		os.Exit(1)
+	}
+	paraRank1 := paraResp.Nodes[0]
+	var paraDense float64
+	if paraRank1.DenseScore != nil {
+		paraDense = *paraRank1.DenseScore
+	}
+	fmt.Printf(" [Criterion 1] Semantic Paraphrase: Rank 1 = %s (S_dense = %.4f, S_hybrid = %.4f)\n",
+		paraRank1.ID, paraDense, paraRank1.SimScore)
+	if paraRank1.ID != "ac-node-consensus" || paraDense <= 0.70 {
+		fmt.Printf("[FATAL] Criterion 1 failed: expected ac-node-consensus with S_dense > 0.70\n")
+		os.Exit(1)
+	}
+
+	// Verification 2: Lexical Keyword Fidelity
+	lexResp, err := engine.Recall(ctx, model.RecallRequest{
+		Query: "worker_connections 4096 reverse proxy tuning",
+		TopK:  3,
+	})
+	if err != nil || len(lexResp.Nodes) == 0 {
+		fmt.Printf("[FATAL] Lexical fidelity recall query failed: %v\n", err)
+		os.Exit(1)
+	}
+	lexRank1 := lexResp.Nodes[0]
+	var lexBM25 float64
+	if lexRank1.BM25Score != nil {
+		lexBM25 = *lexRank1.BM25Score
+	}
+	fmt.Printf(" [Criterion 2] Lexical Keyword Fidelity: Rank 1 = %s (S_bm25 = %.4f, S_hybrid = %.4f)\n",
+		lexRank1.ID, lexBM25, lexRank1.SimScore)
+	if lexRank1.ID != "ac-node-nginx" {
+		fmt.Printf("[FATAL] Criterion 2 failed: expected ac-node-nginx at rank 1\n")
+		os.Exit(1)
+	}
+
+	// Verification 3: Noise Floor Suppression
+	noiseResp, err := engine.Recall(ctx, model.RecallRequest{
+		Query: "Petrelwick deployment",
+		TopK:  3,
+	})
+	if err != nil || len(noiseResp.Nodes) == 0 {
+		fmt.Printf("[FATAL] Noise suppression query failed: %v\n", err)
+		os.Exit(1)
+	}
+	noiseTop := noiseResp.Nodes[0]
+	fmt.Printf(" [Criterion 3] Noise Suppression: Top Similarity = %.4f (Target: < 0.10)\n", noiseTop.SimScore)
+	if noiseTop.SimScore >= 0.10 {
+		fmt.Printf("[FATAL] Criterion 3 failed: expected sim < 0.10 for out-of-vocabulary query, got %.4f\n", noiseTop.SimScore)
+		os.Exit(1)
+	}
+
+	fmt.Println("----------------------------------------------------------------")
+	fmt.Println(" RESULT: PASS - All 5 Acceptance & Verification Criteria Passed!")
 	fmt.Println("================================================================")
 }

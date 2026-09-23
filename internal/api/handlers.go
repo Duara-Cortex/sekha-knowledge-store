@@ -2,13 +2,17 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/consolidation"
+	"github.com/Duara-Cortex/sekha-knowledge-store/internal/embedding"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/model"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/recall"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/store"
@@ -18,6 +22,7 @@ import (
 type Server struct {
 	store               store.Store
 	engine              *recall.Engine
+	embedder            embedding.Embedder
 	consolidationEngine *consolidation.Engine
 	mux                 *http.ServeMux
 	startTime           time.Time
@@ -31,9 +36,15 @@ func NewServer(s store.Store, e *recall.Engine, port int) *Server {
 		e.RegisterNodes(nodes)
 	})
 
+	var emb embedding.Embedder
+	if e != nil {
+		emb = e.Embedder()
+	}
+
 	srv := &Server{
 		store:               s,
 		engine:              e,
+		embedder:            emb,
 		consolidationEngine: ce,
 		mux:                 http.NewServeMux(),
 		startTime:           time.Now(),
@@ -41,6 +52,14 @@ func NewServer(s store.Store, e *recall.Engine, port int) *Server {
 	}
 	srv.registerRoutes()
 	return srv
+}
+
+// SetEmbedder configures the dense embedding engine for the server.
+func (s *Server) SetEmbedder(emb embedding.Embedder) {
+	s.embedder = emb
+	if s.engine != nil && emb != nil {
+		s.engine.SetEmbedder(emb)
+	}
 }
 
 // SetConsolidationEngine overrides the default consolidation engine instance.
@@ -107,6 +126,14 @@ func (s *Server) handleRecall(w http.ResponseWriter, r *http.Request) {
 		val := strings.ToLower(strings.TrimSpace(q.Get("include_embeddings")))
 		req.IncludeEmbeddings = (val == "true" || val == "1" || val == "yes")
 	}
+	if q.Has("hybrid_alpha") {
+		if val, err := strconv.ParseFloat(strings.TrimSpace(q.Get("hybrid_alpha")), 64); err == nil {
+			req.HybridAlpha = &val
+		}
+	}
+	if q.Has("mode") {
+		req.Mode = strings.TrimSpace(q.Get("mode"))
+	}
 	if q.Has("fields") {
 		var queryFields []string
 		for _, fVal := range q["fields"] {
@@ -145,6 +172,23 @@ func (s *Server) handleInsert(w http.ResponseWriter, r *http.Request) {
 			Error:  "invalid JSON payload: " + err.Error(),
 		})
 		return
+	}
+
+	// Compute 384-D dense embedding on-the-fly if vector is omitted in the insert payload
+	for i := range req.Nodes {
+		if len(req.Nodes[i].Embedding) == 0 {
+			text := strings.TrimSpace(req.Nodes[i].Label + " " + req.Nodes[i].Summary)
+			if text != "" {
+				if s.embedder != nil {
+					if emb, err := s.embedder.EmbedText(r.Context(), text); err == nil && len(emb) > 0 {
+						req.Nodes[i].Embedding = emb
+					}
+				}
+				if len(req.Nodes[i].Embedding) == 0 {
+					req.Nodes[i].Embedding = embedding.Generate(text, model.DefaultVectorDim)
+				}
+			}
+		}
 	}
 
 	insertedNodes, err := s.store.InsertNodes(r.Context(), req.Nodes)
@@ -201,18 +245,54 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	nodeCount, edgeCount, _ := s.store.GetCounts(r.Context())
 	uptime := int64(time.Since(s.startTime).Seconds())
 
+	embHealth := s.getEmbeddingHealth(r.Context())
+
 	resp := model.HealthResponse{
-		Status:        "healthy",
-		Node:          "sekha-node1",
-		Port:          s.port,
-		Service:       "sekha-knowledge-store",
-		UptimeSeconds: uptime,
-		NodeCount:     nodeCount,
-		EdgeCount:     edgeCount,
+		Status:          "healthy",
+		Node:            "sekha-node1",
+		Port:            s.port,
+		Service:         "sekha-knowledge-store",
+		UptimeSeconds:   uptime,
+		NodeCount:       nodeCount,
+		EdgeCount:       edgeCount,
+		EmbeddingEngine: &embHealth,
 	}
 
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (s *Server) getEmbeddingHealth(ctx context.Context) model.EmbeddingEngineHealth {
+	if s.embedder != nil {
+		if client, ok := s.embedder.(*embedding.Client); ok {
+			return client.CheckHealth(ctx)
+		}
+		if mock, ok := s.embedder.(*embedding.MockEmbedder); ok {
+			url := os.Getenv("SEKHA_EMBEDDING_URL")
+			if url == "" {
+				url = "mock"
+			}
+			return model.EmbeddingEngineHealth{
+				Enabled:   true,
+				Status:    "reachable",
+				URL:       url,
+				Dimension: mock.Dimension(),
+			}
+		}
+		return model.EmbeddingEngineHealth{
+			Enabled:   true,
+			Status:    "reachable",
+			URL:       os.Getenv("SEKHA_EMBEDDING_URL"),
+			Dimension: model.DefaultVectorDim,
+		}
+	}
+
+	return model.EmbeddingEngineHealth{
+		Enabled:   false,
+		Status:    "offline",
+		URL:       os.Getenv("SEKHA_EMBEDDING_URL"),
+		Dimension: 0,
+	}
 }
 
 // handleConsolidate processes POST /api/v1/memory/consolidate dispatched from Node 2.
@@ -237,8 +317,24 @@ func (s *Server) handleConsolidate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Register novel consolidated nodes directly with in-memory recall index
+	// Compute dense embeddings on-the-fly for any created nodes missing vectors
 	if len(resp.CreatedNodes) > 0 {
+		for i := range resp.CreatedNodes {
+			if len(resp.CreatedNodes[i].Embedding) == 0 {
+				text := strings.TrimSpace(resp.CreatedNodes[i].Label + " " + resp.CreatedNodes[i].Summary)
+				if text != "" {
+					if s.embedder != nil {
+						if emb, err := s.embedder.EmbedText(r.Context(), text); err == nil && len(emb) > 0 {
+							resp.CreatedNodes[i].Embedding = emb
+						}
+					}
+					if len(resp.CreatedNodes[i].Embedding) == 0 {
+						resp.CreatedNodes[i].Embedding = embedding.Generate(text, model.DefaultVectorDim)
+					}
+				}
+			}
+		}
+		// Register novel consolidated nodes directly with in-memory recall index
 		s.engine.RegisterNodes(resp.CreatedNodes)
 	}
 

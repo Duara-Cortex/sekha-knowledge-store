@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/api"
+	"github.com/Duara-Cortex/sekha-knowledge-store/internal/embedding"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/recall"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/store"
 )
@@ -44,15 +45,29 @@ func main() {
 	}
 	defer sqliteStore.Close()
 
+	embCfg := embedding.ConfigFromEnv()
+	var embedClient embedding.Embedder
+	if embCfg.Enabled {
+		client := embedding.NewClient(embCfg, nil)
+		embedClient = client
+		log.Printf("[Embedding] Enabled: true | Endpoint: %s | Dims: %d | Status: %s",
+			client.URL(), embCfg.Dimension, client.CheckHealth(context.Background()).Status)
+	} else {
+		log.Printf("[Embedding] Disabled (no embedding environment configured; operating without external embedding engine)")
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	engineCfg := recall.EngineConfig{
-		DefaultAlpha:      *alpha,
-		DefaultBeta:       *beta,
-		DefaultGamma:      *gamma,
-		DecayHalfLife:     *decayTau,
-		FrequencyMaxCount: 100.0,
-		NeighbourHopBoost: 0.35,
-		MaxCandidatePool:  20,
+		DefaultAlpha:       *alpha,
+		DefaultBeta:        *beta,
+		DefaultGamma:       *gamma,
+		DefaultHybridAlpha: 0.65,
+		DecayHalfLife:      *decayTau,
+		FrequencyMaxCount:  100.0,
+		NeighbourHopBoost:  0.35,
+		MaxCandidatePool:   20,
+		VectorDims:         embCfg.Dimension,
+		Embedder:           embedClient,
 	}
 
 	engine, err := recall.NewEngine(ctx, sqliteStore, engineCfg)
@@ -85,7 +100,7 @@ func main() {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("[Sekha Knowledge Store] Listening on http://0.0.0.0:%d", *port)
+		log.Printf("[Sekha Knowledge Store] Listening on port %d", *port)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("[FATAL] HTTP server failed: %v", err)
 		}

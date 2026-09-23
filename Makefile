@@ -4,8 +4,9 @@ BINARY_NAME=sekha-knowledge-store
 CONSOLIDATION_BINARY=sekha-consolidation
 VALIDATE_NAME=sekha-validate
 VALIDATE_CONSOLIDATION_NAME=sekha-validate-consolidation
-NODE1_HOST=192.168.8.213
-NODE1_USER=admin
+NODE1_HOST ?= $(SEKHA_NODE1_HOST)
+NODE1_USER ?= $(or $(SEKHA_NODE1_USER),$(SEKHA_USER),admin)
+ENV_FILE ?= $(SEKHA_ENV_FILE)
 
 all: check-go build
 
@@ -43,6 +44,15 @@ install: build
 	sudo cp bin/$(VALIDATE_CONSOLIDATION_NAME) /usr/local/bin/
 	sudo cp systemd/sekha-knowledge-store.service /etc/systemd/system/
 	sudo cp systemd/sekha-consolidation.service /etc/systemd/system/
+	@if [ -n "$(ENV_FILE)" ] && [ -f "$(ENV_FILE)" ]; then \
+		echo "Installing environment configuration from $(ENV_FILE) to /etc/default/sekha..."; \
+		sudo mkdir -p /etc/default; \
+		sudo cp $(ENV_FILE) /etc/default/sekha; \
+	elif [ -f /etc/default/sekha ]; then \
+		echo "Preserving existing /etc/default/sekha configuration."; \
+	else \
+		echo "No environment file specified or found; proceeding without external embedding configuration."; \
+	fi
 	sudo mkdir -p /var/lib/sekha
 	sudo chown -R $(NODE1_USER):$(NODE1_USER) /var/lib/sekha 2>/dev/null || true
 	sudo systemctl daemon-reload
