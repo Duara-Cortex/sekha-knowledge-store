@@ -122,9 +122,117 @@ CREATE TABLE IF NOT EXISTS episodic_traces (
    - **Public Exemption:** Telemetry and health check endpoints (`/health`, `/api/v1/memory/health`, `/api/v1/consolidation/health`) remain accessible without credentials so node monitoring daemons (such as `/usr/local/bin/sekha status`) function uninterrupted.
    - If `SEKHA_API_KEY` is empty or unset, the daemons operate in permissive development mode with an explicit startup warning.
 
-2. **TLS / HTTPS Transport:**
+2. **TLS / HTTPS Transport & Certificate Provisioning:**
    - Both daemons support encrypted TLS transport via `--tls-cert` and `--tls-key` flags or `SEKHA_TLS_CERT` and `SEKHA_TLS_KEY` environment variables.
-   - When both certificate and key are provided, servers listen over HTTPS with TLS 1.2/1.3.
+   - When both certificate and key are provided, servers listen over HTTPS with TLS 1.2/1.3 and automatic HTTP/2 negotiation.
+
+   #### Manual TLS Certificate Setup Guide
+   Because different clusters and organizations use different CA architectures, you can provision your own private Cluster Root CA and node server certificates manually.
+
+   > [!IMPORTANT]
+   > **Go TLS Subject Alternative Name (SAN) Requirement:**  
+   > Go's TLS stack strictly enforces Subject Alternative Names (SANs) for both IP addresses and DNS hostnames. Plain Common Name (CN) matching without SANs is rejected by Go clients. The certificate must contain explicit `IP` and `DNS` SAN entries matching your node's address and hostname.
+
+   **Step 1: Generate Private Cluster Root CA** (Run on management workstation or node):
+   ```bash
+   mkdir -p certs && cd certs
+
+   # Generate 4096-bit Root CA private key
+   openssl genrsa -out cluster-ca.key 4096
+
+   # Create self-signed Root CA certificate (valid for 5 years)
+   openssl req -x509 -new -nodes -key cluster-ca.key -sha256 -days 1825 \
+     -subj "/CN=Sekha Cluster Root CA/O=Duara-Cortex" \
+     -out cluster-ca.crt
+   ```
+
+   **Step 2: Generate Node Private Key & CSR:**
+   ```bash
+   openssl genrsa -out server.key 2048
+
+   openssl req -new -key server.key \
+     -subj "/CN=sekha-node1/O=Duara-Cortex" \
+     -out server.csr
+   ```
+
+   **Step 3: Create OpenSSL SAN Extension Configuration (`server.ext`):**  
+   Adapt the IP and DNS entries to match your target node's network identity:
+   ```bash
+   cat > server.ext <<EOF
+   authorityKeyIdentifier=keyid,issuer
+   basicConstraints=CA:FALSE
+   keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
+   subjectAltName = @alt_names
+
+   [alt_names]
+   IP.1 = 192.168.8.213     # Replace with your Node static IP
+   IP.2 = 127.0.0.1         # Localhost IP
+   DNS.1 = sekha-node1      # Replace with your Node hostname
+   DNS.2 = localhost        # Localhost DNS
+   EOF
+   ```
+
+   **Step 4: Sign the Node Certificate with the Cluster Root CA:**
+   ```bash
+   openssl x509 -req -in server.csr -CA cluster-ca.crt -CAkey cluster-ca.key \
+     -CAcreateserial -out server.crt -days 825 -sha256 -extfile server.ext
+
+   # Set strict file permissions
+   chmod 600 server.key cluster-ca.key
+   chmod 644 server.crt cluster-ca.crt
+   ```
+
+   **Step 5: Deploy Certificates on Target Node:**
+   ```bash
+   sudo mkdir -p /etc/sekha/certs
+   sudo cp server.crt /etc/sekha/certs/server.crt
+   sudo cp server.key /etc/sekha/certs/server.key
+   sudo cp cluster-ca.crt /etc/sekha/certs/cluster-ca.crt
+
+   sudo chmod 755 /etc/sekha/certs
+   sudo chmod 600 /etc/sekha/certs/server.key
+   sudo chmod 644 /etc/sekha/certs/server.crt /etc/sekha/certs/cluster-ca.crt
+   sudo chown -R admin:admin /etc/sekha/certs 2>/dev/null || sudo chown -R root:root /etc/sekha/certs
+   ```
+
+   **Step 6: Configure Environment (`/etc/default/sekha`):**
+   ```bash
+   sudo tee -a /etc/default/sekha <<EOF
+
+   # TLS/HTTPS Transport Configuration
+   SEKHA_TLS_CERT=/etc/sekha/certs/server.crt
+   SEKHA_TLS_KEY=/etc/sekha/certs/server.key
+   EOF
+   ```
+
+   **Step 7: Restart Services & Verify Startup Logs:**
+   ```bash
+   sudo systemctl restart sekha-knowledge-store sekha-consolidation
+
+   # Verify knowledge store TLS listener:
+   journalctl -u sekha-knowledge-store -n 20 --no-pager
+   # Expected log:
+   # [Sekha Knowledge Store] Listening with TLS/HTTPS on port 8084 (cert: /etc/sekha/certs/server.crt)
+
+   # Verify consolidation daemon TLS listener:
+   journalctl -u sekha-consolidation -n 20 --no-pager
+   # Expected log:
+   # [Sekha Consolidation Daemon] Listening with TLS/HTTPS on port 8085 (cert: /etc/sekha/certs/server.crt)
+   ```
+
+   **Step 8: Verify HTTPS Connectivity with `curl`:**
+   ```bash
+   # Unauthenticated health check over HTTPS
+   curl --cacert /etc/sekha/certs/cluster-ca.crt -i https://<NODE_IP>:8084/health
+
+   # Authenticated graph endpoint over HTTPS
+   API_KEY=$(grep SEKHA_API_KEY /etc/default/sekha | cut -d '=' -f2)
+   curl --cacert /etc/sekha/certs/cluster-ca.crt -H "X-API-Key: $API_KEY" -i https://<NODE_IP>:8084/api/v1/memory/graph
+
+   # Consolidation daemon health check over HTTPS
+   curl --cacert /etc/sekha/certs/cluster-ca.crt -i https://<NODE_IP>:8085/health
+   ```
+
 
 3. **AES-256-GCM Encryption-at-Rest (`is_secret`):**
    - The relational schema includes an `is_secret INTEGER NOT NULL DEFAULT 0` column on the `nodes` table.
@@ -226,9 +334,9 @@ SEKHA_API_KEY=your_cluster_secret_key_here
 # Node-local master key for AES-256-GCM encryption-at-rest (or stored in /etc/sekha/master.key)
 SEKHA_MASTER_KEY=your_secure_random_node_master_key_here
 
-# TLS / HTTPS transport configuration (optional)
-# SEKHA_TLS_CERT=/etc/ssl/certs/sekha.crt
-# SEKHA_TLS_KEY=/etc/ssl/private/sekha.key
+# TLS / HTTPS transport configuration
+# SEKHA_TLS_CERT=/etc/sekha/certs/server.crt
+# SEKHA_TLS_KEY=/etc/sekha/certs/server.key
 ```
 
 After modifying `/etc/default/sekha`, restart the services to apply changes:
