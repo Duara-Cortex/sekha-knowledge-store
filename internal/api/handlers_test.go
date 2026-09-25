@@ -1821,3 +1821,68 @@ func TestConsolidation_AuthMiddleware_Enforcement(t *testing.T) {
 	}
 }
 
+func TestAPI_ConsolidateSecretFlagPropagation(t *testing.T) {
+	ctx := context.Background()
+	ms := newAPIMockStore()
+
+	cipher, err := security.NewAESGCMCipher("")
+	if err != nil {
+		t.Fatalf("failed creating cipher: %v", err)
+	}
+
+	cfg := recall.DefaultConfig()
+	cfg.Cipher = cipher
+	engine, err := recall.NewEngine(ctx, ms, cfg)
+	if err != nil {
+		t.Fatalf("failed creating recall engine: %v", err)
+	}
+
+	server := NewServer(ms, engine, 8084)
+	server.SetAPIKey("secret123")
+
+	payload := model.ConsolidateRequest{
+		TraceID:     "trace-api-sec-01",
+		SessionID:   "sess-api-sec",
+		TaskGoal:    "Provision Kestrel Master Token",
+		Outcome:     model.OutcomeSuccess,
+		Synchronous: true,
+		IsSecret:    true,
+		Trajectory: []model.TrajectoryStep{
+			{
+				StepIndex:   1,
+				Thought:     "Generating cluster secret token-12345",
+				Action:      "generate_token",
+				Observation: "Token generated",
+				Status:      "success",
+			},
+		},
+	}
+
+	body, _ := json.Marshal(payload)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/memory/consolidate", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", "secret123")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp model.ConsolidateResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed unmarshaling consolidate response: %v", err)
+	}
+
+	if len(resp.CreatedNodes) == 0 {
+		t.Fatalf("expected created nodes, got 0")
+	}
+
+	for _, n := range resp.CreatedNodes {
+		if !n.IsSecret {
+			t.Errorf("expected created node %s to carry IsSecret = true", n.ID)
+		}
+	}
+}
+
+

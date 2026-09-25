@@ -101,6 +101,7 @@ func (f *FusionEngine) Fuse(ctx context.Context, extraction ExtractionResult, re
 				StabilityScore:   initialStability,
 				ImportanceScore:  extracted.ImportanceScore,
 				IsArchived:       false,
+				IsSecret:         extracted.IsSecret || extraction.IsSecret,
 			})
 			result.EntitiesCreated++
 		}
@@ -139,4 +140,11 @@ func (f *FusionEngine) Fuse(ctx context.Context, extraction ExtractionResult, re
 	}
 
 	return result, nil
+}
+
+// FuseTrace extracts and assimilates an episodic deliberation trace directly.
+func (f *FusionEngine) FuseTrace(ctx context.Context, trace model.EpisodicTrace, refTime time.Time) (*FusionResult, error) {
+	extractor := NewExtractor(model.DefaultVectorDim)
+	extracted := extractor.Extract(trace)
+	return f.Fuse(ctx, extracted, refTime)
 }

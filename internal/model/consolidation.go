@@ -21,6 +21,7 @@ type SensoryItem struct {
 	Salience  float64   `json:"salience"`
 	Source    string    `json:"source,omitempty"`
 	Timestamp time.Time `json:"timestamp"`
+	IsSecret  bool      `json:"is_secret,omitempty"`
 }
 
 // TrajectoryStep captures a deliberate reasoning step within an episodic trace.
@@ -31,6 +32,7 @@ type TrajectoryStep struct {
 	Observation string    `json:"observation,omitempty"`
 	Status      string    `json:"status"`
 	Timestamp   time.Time `json:"timestamp"`
+	IsSecret    bool      `json:"is_secret,omitempty"`
 }
 
 // CandidateAction captures proposed or committed actions during deliberation.
@@ -40,6 +42,7 @@ type CandidateAction struct {
 	Payload   map[string]interface{} `json:"payload,omitempty"`
 	Committed bool                   `json:"committed"`
 	CreatedAt time.Time              `json:"created_at"`
+	IsSecret  bool                   `json:"is_secret,omitempty"`
 }
 
 // EpisodicTrace represents a completed deliberation trajectory dispatched from Node 2.
@@ -55,6 +58,7 @@ type EpisodicTrace struct {
 	Consolidated     bool              `json:"consolidated"`
 	CreatedAt        time.Time         `json:"created_at"`
 	ConsolidatedAt   *time.Time        `json:"consolidated_at,omitempty"`
+	IsSecret         bool              `json:"is_secret,omitempty"`
 }
 
 // ConsolidateRequest defines the ingestion payload for POST /api/v1/memory/consolidate.
@@ -70,6 +74,7 @@ type ConsolidateRequest struct {
 	CandidateActions []CandidateAction `json:"candidate_actions,omitempty"`
 	Anchors          []string          `json:"anchors,omitempty"`     // Optional anchor tags (e.g. ["#project:kestrel"])
 	Synchronous      bool              `json:"synchronous,omitempty"` // If true, triggers immediate inline fusion
+	IsSecret         bool              `json:"is_secret,omitempty"`   // Secret flag propagated to fused nodes
 }
 
 // ConsolidateResponse returns ingestion receipts and consolidation statistics.
@@ -93,6 +98,7 @@ type ExtractedEntity struct {
 	Embedding       []float32 `json:"embedding,omitempty"`
 	Salience        float64   `json:"salience"`
 	ImportanceScore float64   `json:"importance_score"`
+	IsSecret        bool      `json:"is_secret,omitempty"`
 }
 
 // ExtractedRelation represents a causal, temporal, or co-activation link between extracted entities.
