@@ -45,6 +45,7 @@ type ExtractionResult struct {
 	Outcome  string
 	Salience float64
 	Anchors  []string
+	IsSecret bool
 }
 
 // Extract processes a single episodic deliberation trace into graph entities and causal relationships.
@@ -53,6 +54,7 @@ func (e *Extractor) Extract(trace model.EpisodicTrace) ExtractionResult {
 		Entities: make([]model.ExtractedEntity, 0),
 		Edges:    make([]model.ExtractedRelation, 0),
 		Anchors:  trace.Anchors,
+		IsSecret: trace.IsSecret,
 	}
 
 	// 1. Determine resolved outcome and salience multiplier
@@ -87,6 +89,7 @@ func (e *Extractor) Extract(trace model.EpisodicTrace) ExtractionResult {
 		Embedding:       e.generateEmbedding(goalText),
 		Salience:        res.Salience,
 		ImportanceScore: computeImportance("task_goal", goalText, goalSummary, trace.Anchors),
+		IsSecret:        trace.IsSecret,
 	}
 	res.Entities = append(res.Entities, goalEntity)
 	seenLabels[strings.ToLower(goalText)] = goalID
@@ -114,6 +117,7 @@ func (e *Extractor) Extract(trace model.EpisodicTrace) ExtractionResult {
 			Embedding:       e.generateEmbedding(stepSummary),
 			Salience:        res.Salience * 0.85,
 			ImportanceScore: computeImportance("decision", stepLabel, stepSummary, trace.Anchors),
+			IsSecret:        step.IsSecret || trace.IsSecret,
 		}
 		res.Entities = append(res.Entities, stepEntity)
 
@@ -155,6 +159,7 @@ func (e *Extractor) Extract(trace model.EpisodicTrace) ExtractionResult {
 					Embedding:       e.generateEmbedding(kw),
 					Salience:        res.Salience * 0.7,
 					ImportanceScore: computeImportance("concept", kw, conceptSummary, trace.Anchors),
+					IsSecret:        step.IsSecret || trace.IsSecret,
 				})
 			}
 
@@ -183,6 +188,7 @@ func (e *Extractor) Extract(trace model.EpisodicTrace) ExtractionResult {
 			Embedding:       e.generateEmbedding(chunk.Text),
 			Salience:        chunk.Salience * res.Salience,
 			ImportanceScore: computeImportance("sensory_fact", chunkLabel, chunk.Text, trace.Anchors),
+			IsSecret:        chunk.IsSecret || trace.IsSecret,
 		}
 		res.Entities = append(res.Entities, chunkEntity)
 

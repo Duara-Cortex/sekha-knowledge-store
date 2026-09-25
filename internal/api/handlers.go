@@ -377,6 +377,9 @@ func (s *Server) handleConsolidate(w http.ResponseWriter, r *http.Request) {
 	// Compute dense embeddings on-the-fly for any created nodes missing vectors
 	if len(resp.CreatedNodes) > 0 {
 		for i := range resp.CreatedNodes {
+			if req.IsSecret && !resp.CreatedNodes[i].IsSecret {
+				resp.CreatedNodes[i].IsSecret = true
+			}
 			if len(resp.CreatedNodes[i].Embedding) == 0 {
 				text := strings.TrimSpace(resp.CreatedNodes[i].Label + " " + resp.CreatedNodes[i].Summary)
 				if text != "" {
@@ -392,7 +395,9 @@ func (s *Server) handleConsolidate(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		// Register novel consolidated nodes directly with in-memory recall index
-		s.engine.RegisterNodes(resp.CreatedNodes)
+		if s.engine != nil {
+			s.engine.RegisterNodes(resp.CreatedNodes)
+		}
 	}
 
 	if resp.Synchronous {

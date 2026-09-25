@@ -75,6 +75,7 @@ func (e *Engine) IngestTrace(ctx context.Context, req model.ConsolidateRequest) 
 		Trajectory:       req.Trajectory,
 		CandidateActions: req.CandidateActions,
 		Anchors:          req.Anchors,
+		IsSecret:         req.IsSecret,
 		CreatedAt:        time.Now().UTC(),
 	}
 
@@ -120,6 +121,33 @@ func (e *Engine) IngestTrace(ctx context.Context, req model.ConsolidateRequest) 
 	}
 
 	return resp, nil
+}
+
+// FuseTrace immediately extracts and assimilates a consolidation request into the knowledge graph.
+func (e *Engine) FuseTrace(ctx context.Context, req model.ConsolidateRequest, refTime time.Time) (*FusionResult, error) {
+	if refTime.IsZero() {
+		refTime = time.Now().UTC()
+	}
+	trace := model.EpisodicTrace{
+		ID:               req.TraceID,
+		SessionID:        req.SessionID,
+		TaskGoal:         req.TaskGoal,
+		Outcome:          req.Outcome,
+		SensoryContext:   req.SensoryContext,
+		Trajectory:       req.Trajectory,
+		CandidateActions: req.CandidateActions,
+		Anchors:          req.Anchors,
+		IsSecret:         req.IsSecret,
+		CreatedAt:        refTime,
+	}
+	if trace.TaskGoal == "" && req.ActiveGoal != "" {
+		trace.TaskGoal = req.ActiveGoal
+	}
+	if trace.Outcome == "" && req.Status != "" {
+		trace.Outcome = req.Status
+	}
+	extracted := e.extractor.Extract(trace)
+	return e.fusion.Fuse(ctx, extracted, refTime)
 }
 
 // RunConsolidationCycle executes a complete consolidation batch:

@@ -4,11 +4,14 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/consolidation"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/model"
+	"github.com/Duara-Cortex/sekha-knowledge-store/internal/recall"
+	"github.com/Duara-Cortex/sekha-knowledge-store/internal/security"
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/store"
 )
 
@@ -498,5 +501,360 @@ func TestExecuteScopedDecay(t *testing.T) {
 	cfgNode, err := s.GetNode(ctx, "config-1")
 	if err != nil || cfgNode == nil || cfgNode.IsArchived {
 		t.Errorf("config-1 was improperly archived")
+	}
+}
+
+func TestExtractorSecretFlag(t *testing.T) {
+	extractor := consolidation.NewExtractor(64)
+
+	// 1. Trace with IsSecret: true should mark all derived entities as secret
+	traceSecret := model.EpisodicTrace{
+		ID:        "trace-sec-01",
+		SessionID: "sess-sec-01",
+		TaskGoal:  "Generate Master Encryption Key",
+		Outcome:   model.OutcomeSuccess,
+		IsSecret:  true,
+		Trajectory: []model.TrajectoryStep{
+			{
+				StepIndex:   1,
+				Thought:     "Exporting master secret key",
+				Action:      "export_key",
+				Observation: "Key exported successfully",
+				Status:      "success",
+			},
+		},
+		SensoryContext: []model.SensoryItem{
+			{
+				Text:     "Cluster token master-secret-data",
+				Salience: 0.8,
+			},
+		},
+	}
+
+	resSecret := extractor.Extract(traceSecret)
+	if !resSecret.IsSecret {
+		t.Errorf("expected ExtractionResult.IsSecret to be true")
+	}
+	if len(resSecret.Entities) == 0 {
+		t.Fatalf("expected entities to be extracted")
+	}
+	for _, e := range resSecret.Entities {
+		if !e.IsSecret {
+			t.Errorf("expected entity %s (%s) to have IsSecret = true", e.ID, e.EntityType)
+		}
+	}
+
+	// 2. Trace with IsSecret: false but individual step/sensory secret flag
+	traceMixed := model.EpisodicTrace{
+		ID:        "trace-mixed-01",
+		SessionID: "sess-mixed-01",
+		TaskGoal:  "Public Deployment Task",
+		Outcome:   model.OutcomeSuccess,
+		IsSecret:  false,
+		Trajectory: []model.TrajectoryStep{
+			{
+				StepIndex:   1,
+				Thought:     "Public step with no secrets",
+				Action:      "ping_host",
+				Status:      "success",
+				IsSecret:    false,
+			},
+			{
+				StepIndex:   2,
+				Thought:     "Injecting secret password pass123",
+				Action:      "inject_cred",
+				Status:      "success",
+				IsSecret:    true,
+			},
+		},
+		SensoryContext: []model.SensoryItem{
+			{
+				Text:     "Public telemetry chunk",
+				Salience: 0.5,
+				IsSecret: false,
+			},
+			{
+				Text:     "Confidential secret credential item",
+				Salience: 0.9,
+				IsSecret: true,
+			},
+		},
+	}
+
+	resMixed := extractor.Extract(traceMixed)
+	if resMixed.IsSecret {
+		t.Errorf("expected mixed trace ExtractionResult.IsSecret to be false")
+	}
+	for _, e := range resMixed.Entities {
+		if strings.Contains(e.Summary, "pass123") || strings.Contains(e.Summary, "Confidential secret") {
+			if !e.IsSecret {
+				t.Errorf("expected secret entity %s to have IsSecret = true", e.ID)
+			}
+		} else if e.EntityType == "task_goal" {
+			if e.IsSecret {
+				t.Errorf("expected public task_goal entity to have IsSecret = false")
+			}
+		}
+	}
+}
+
+func TestConsolidationSecretPropagationAndRecall(t *testing.T) {
+	ctx := context.Background()
+	s := createTestStore(t, "test_secret_consolidation.db")
+
+	cipher, err := security.NewAESGCMCipher("")
+	if err != nil {
+		t.Fatalf("failed to create cipher: %v", err)
+	}
+	s.SetCipher(cipher)
+
+	recallCfg := recall.DefaultConfig()
+	recallCfg.Cipher = cipher
+	recallEngine, err := recall.NewEngine(ctx, s, recallCfg)
+	if err != nil {
+		t.Fatalf("failed to create recall engine: %v", err)
+	}
+
+	cfg := model.DefaultDecayConfig()
+	consEngine := consolidation.NewEngine(s, cfg)
+	consEngine.AddNodeListener(func(nodes []model.Node) {
+		recallEngine.RegisterNodes(nodes)
+	})
+
+	secretPlaintext := "sk-live-super-secret-token-xyz-12345"
+	trace := model.ConsolidateRequest{
+		TraceID:     "trace-secret-prop-01",
+		SessionID:   "sess-secret-prop",
+		TaskGoal:    "Provision Production API Secret Key",
+		Outcome:     model.OutcomeSuccess,
+		Synchronous: true,
+		IsSecret:    true,
+		Trajectory: []model.TrajectoryStep{
+			{
+				StepIndex:   1,
+				Thought:     "Acquiring credential " + secretPlaintext,
+				Action:      "fetch_token",
+				Observation: "Token retrieved securely",
+				Status:      "success",
+			},
+		},
+		SensoryContext: []model.SensoryItem{
+			{
+				Text:     "Cluster secret environment seed",
+				Salience: 0.9,
+			},
+		},
+	}
+
+	resp, err := consEngine.IngestTrace(ctx, trace)
+	if err != nil {
+		t.Fatalf("IngestTrace failed: %v", err)
+	}
+	if resp.Status != "consolidated" {
+		t.Fatalf("expected status 'consolidated', got %s", resp.Status)
+	}
+	if len(resp.CreatedNodes) == 0 {
+		t.Fatalf("expected created nodes, got 0")
+	}
+
+	// 1. Verify in-memory response nodes carry IsSecret: true
+	for _, n := range resp.CreatedNodes {
+		if !n.IsSecret {
+			t.Errorf("expected created node %s to have IsSecret = true", n.ID)
+		}
+	}
+
+	// 2. Verify SQLite storage: is_secret = 1 and summary starts with enc:v1:
+	activeNodes, err := s.GetAllActiveNodes(ctx)
+	if err != nil {
+		t.Fatalf("GetAllActiveNodes failed: %v", err)
+	}
+	if len(activeNodes) == 0 {
+		t.Fatalf("expected active nodes in SQLite store, got 0")
+	}
+
+	foundSecretNode := false
+	for _, n := range activeNodes {
+		if !n.IsSecret {
+			t.Errorf("expected persistent node %s to have IsSecret = true, got false", n.ID)
+		}
+		if !strings.HasPrefix(n.Summary, "enc:v1:") {
+			t.Errorf("expected node %s summary to be encrypted with 'enc:v1:', got: %s", n.ID, n.Summary)
+		}
+		if strings.Contains(n.Summary, secretPlaintext) {
+			t.Errorf("plaintext secret leaked in SQLite summary: %s", n.Summary)
+		}
+		if n.EntityType == "decision" {
+			foundSecretNode = true
+		}
+	}
+	if !foundSecretNode {
+		t.Errorf("expected to find decision node in active nodes")
+	}
+
+	// 3. Verify recall without include_secrets masks summary as [REDACTED_SECRET]
+	recallRespRedacted, err := recallEngine.Recall(ctx, model.RecallRequest{
+		Query:          "Provision Production API Secret Key",
+		IncludeSecrets: false,
+	})
+	if err != nil {
+		t.Fatalf("recall failed: %v", err)
+	}
+	if len(recallRespRedacted.Nodes) == 0 {
+		t.Fatalf("expected recall results, got 0")
+	}
+	for _, sn := range recallRespRedacted.Nodes {
+		if !sn.IsSecret {
+			t.Errorf("expected recall result %s to have IsSecret = true", sn.ID)
+		}
+		if sn.Summary != "[REDACTED_SECRET]" {
+			t.Errorf("expected redacted summary '[REDACTED_SECRET]', got: %q", sn.Summary)
+		}
+	}
+
+	// 4. Verify recall with include_secrets: true returns decrypted plaintext summary
+	recallRespPlain, err := recallEngine.Recall(ctx, model.RecallRequest{
+		Query:          "fetch_token",
+		IncludeSecrets: true,
+	})
+	if err != nil {
+		t.Fatalf("recall with include_secrets failed: %v", err)
+	}
+	if len(recallRespPlain.Nodes) == 0 {
+		t.Fatalf("expected recall results with include_secrets, got 0")
+	}
+	var foundDecrypted bool
+	for _, sn := range recallRespPlain.Nodes {
+		if !sn.IsSecret {
+			t.Errorf("expected recall result %s to have IsSecret = true", sn.ID)
+		}
+		if strings.HasPrefix(sn.Summary, "enc:v1:") {
+			t.Errorf("summary was not decrypted, still has ciphertext prefix: %s", sn.Summary)
+		}
+		if sn.Summary == "[REDACTED_SECRET]" {
+			t.Errorf("summary should not be redacted when include_secrets: true, got: %s", sn.Summary)
+		}
+		if strings.Contains(sn.Summary, secretPlaintext) {
+			foundDecrypted = true
+		}
+	}
+	if !foundDecrypted {
+		t.Errorf("expected to find decrypted plaintext %q in results", secretPlaintext)
+	}
+}
+
+func TestConsolidationSecretBackgroundCycle(t *testing.T) {
+	ctx := context.Background()
+	s := createTestStore(t, "test_secret_bg_consolidation.db")
+
+	cipher, err := security.NewAESGCMCipher("")
+	if err != nil {
+		t.Fatalf("failed to create cipher: %v", err)
+	}
+	s.SetCipher(cipher)
+
+	recallCfg := recall.DefaultConfig()
+	recallCfg.Cipher = cipher
+	recallEngine, err := recall.NewEngine(ctx, s, recallCfg)
+	if err != nil {
+		t.Fatalf("failed to create recall engine: %v", err)
+	}
+
+	cfg := model.DefaultDecayConfig()
+	consEngine := consolidation.NewEngine(s, cfg)
+	consEngine.AddNodeListener(func(nodes []model.Node) {
+		recallEngine.RegisterNodes(nodes)
+	})
+
+	secretData := "vault-bg-token-987654"
+	trace := model.ConsolidateRequest{
+		TraceID:     "trace-bg-sec-01",
+		SessionID:   "sess-bg-sec",
+		TaskGoal:    "Background Credential Rotation Pipeline",
+		Outcome:     model.OutcomeSuccess,
+		Synchronous: false,
+		IsSecret:    true,
+		Trajectory: []model.TrajectoryStep{
+			{
+				StepIndex:   1,
+				Thought:     "Rotating credentials " + secretData,
+				Action:      "rotate_credentials",
+				Status:      "success",
+			},
+		},
+	}
+
+	// 1. Ingest asynchronously (queues trace)
+	resp, err := consEngine.IngestTrace(ctx, trace)
+	if err != nil {
+		t.Fatalf("IngestTrace failed: %v", err)
+	}
+	if resp.Status != "accepted" {
+		t.Errorf("expected status 'accepted', got %s", resp.Status)
+	}
+
+	// 2. Run background consolidation cycle
+	cycleResp, err := consEngine.RunConsolidationCycle(ctx, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("RunConsolidationCycle failed: %v", err)
+	}
+	if cycleResp.TracesFused != 1 {
+		t.Errorf("expected 1 trace fused, got %d", cycleResp.TracesFused)
+	}
+
+	// 3. Verify SQLite storage contains encrypted nodes with is_secret = 1
+	activeNodes, err := s.GetAllActiveNodes(ctx)
+	if err != nil {
+		t.Fatalf("GetAllActiveNodes failed: %v", err)
+	}
+	if len(activeNodes) == 0 {
+		t.Fatalf("expected active nodes after consolidation cycle")
+	}
+
+	for _, n := range activeNodes {
+		if !n.IsSecret {
+			t.Errorf("node %s is missing IsSecret = true", n.ID)
+		}
+		if !strings.HasPrefix(n.Summary, "enc:v1:") {
+			t.Errorf("node %s summary is not encrypted: %s", n.ID, n.Summary)
+		}
+		if strings.Contains(n.Summary, secretData) {
+			t.Errorf("plaintext leaked in node %s summary: %s", n.ID, n.Summary)
+		}
+	}
+
+	// 4. Verify recall masking
+	recRedacted, err := recallEngine.Recall(ctx, model.RecallRequest{
+		Query:          "Credential Rotation",
+		IncludeSecrets: false,
+	})
+	if err != nil {
+		t.Fatalf("recall failed: %v", err)
+	}
+	if len(recRedacted.Nodes) == 0 {
+		t.Fatalf("expected recall results, got 0")
+	}
+	for _, sn := range recRedacted.Nodes {
+		if sn.Summary != "[REDACTED_SECRET]" {
+			t.Errorf("expected '[REDACTED_SECRET]', got %q", sn.Summary)
+		}
+	}
+
+	// 5. Verify recall unmasking
+	recPlain, err := recallEngine.Recall(ctx, model.RecallRequest{
+		Query:          "Credential Rotation",
+		IncludeSecrets: true,
+	})
+	if err != nil {
+		t.Fatalf("recall with include_secrets failed: %v", err)
+	}
+	var foundPlain bool
+	for _, sn := range recPlain.Nodes {
+		if strings.Contains(sn.Summary, secretData) {
+			foundPlain = true
+		}
+	}
+	if !foundPlain {
+		t.Errorf("expected to find plaintext %q in unmasked recall results", secretData)
 	}
 }
