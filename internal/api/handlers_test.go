@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -1884,5 +1885,238 @@ func TestAPI_ConsolidateSecretFlagPropagation(t *testing.T) {
 		}
 	}
 }
+
+func TestAPIServer_LargeTracePayloadIngestion(t *testing.T) {
+	ms := newAPIMockStore()
+	ctx := context.Background()
+
+	engine, err := recall.NewEngine(ctx, ms, recall.DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+	server := NewServer(ms, engine, 8084)
+
+	// Test 250 KB, 500 KB, and 1 MB payloads
+	sizesKB := []int{250, 500, 1024}
+	for _, sizeKB := range sizesKB {
+		largeChunk := strings.Repeat("A", sizeKB*1024)
+		reqPayload := model.ConsolidateRequest{
+			TraceID:     fmt.Sprintf("trace-large-%dkb", sizeKB),
+			SessionID:   fmt.Sprintf("sess-%dkb", sizeKB),
+			TaskGoal:    fmt.Sprintf("Ingest large execution trace %d KB", sizeKB),
+			Outcome:     model.OutcomeSuccess,
+			Synchronous: true,
+			SensoryContext: []model.SensoryItem{
+				{
+					Text:     largeChunk,
+					Salience: 0.9,
+				},
+			},
+			Trajectory: []model.TrajectoryStep{
+				{
+					StepIndex:   1,
+					Thought:     "Processing large telemetry buffer",
+					Action:      "parse_telemetry",
+					Observation: "Parsed successfully",
+					Status:      "success",
+				},
+			},
+		}
+
+		body, err := json.Marshal(reqPayload)
+		if err != nil {
+			t.Fatalf("failed marshaling payload: %v", err)
+		}
+
+		if len(body) < sizeKB*1024 {
+			t.Fatalf("expected payload >= %d bytes, got %d", sizeKB*1024, len(body))
+		}
+
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/memory/consolidate", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected status 200 for %d KB trace, got %d: %s", sizeKB, rec.Code, rec.Body.String())
+		}
+
+		var resp model.ConsolidateResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed unmarshaling response for %d KB trace: %v", sizeKB, err)
+		}
+		if resp.Status != "consolidated" {
+			t.Errorf("expected consolidated status, got %s", resp.Status)
+		}
+	}
+}
+
+func TestAPIServer_PayloadExceedsLimit413(t *testing.T) {
+	ms := newAPIMockStore()
+	ctx := context.Background()
+
+	engine, err := recall.NewEngine(ctx, ms, recall.DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+	server := NewServer(ms, engine, 8084)
+
+	// Set SEKHA_MAX_BODY_BYTES to 1 MB (1048576)
+	t.Setenv("SEKHA_MAX_BODY_BYTES", "1048576")
+
+	// Create payload > 1 MB (e.g. 1.5 MB)
+	largeChunk := strings.Repeat("Over-limit payload data block for testing HTTP 413 response. ", (1500*1024)/60)
+	reqPayload := model.ConsolidateRequest{
+		TraceID:     "trace-oversized",
+		SessionID:   "sess-oversized",
+		TaskGoal:    "Test oversized trace rejection",
+		Outcome:     model.OutcomeSuccess,
+		Synchronous: true,
+		SensoryContext: []model.SensoryItem{
+			{
+				Text:     largeChunk,
+				Salience: 0.9,
+			},
+		},
+	}
+
+	body, err := json.Marshal(reqPayload)
+	if err != nil {
+		t.Fatalf("failed marshaling: %v", err)
+	}
+	if len(body) <= 1048576 {
+		t.Fatalf("expected payload > 1 MB, got %d", len(body))
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/memory/consolidate", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected status 413 Payload Too Large, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAPIServer_DynamicEntityScalingAcrossTraceSizes(t *testing.T) {
+	ms := newAPIMockStore()
+	ctx := context.Background()
+
+	engine, err := recall.NewEngine(ctx, ms, recall.DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+	server := NewServer(ms, engine, 8084)
+
+	// 1. Networking trace (~1 KB)
+	var netLogs strings.Builder
+	netLogs.WriteString("10:00:01.000 [NET] interface eth0 link up 1000Mbps full duplex\n")
+	netLogs.WriteString("10:00:01.100 [TCP] inbound connection from 192.168.1.150:54321 to 192.168.1.10:8084\n")
+	netLogs.WriteString("10:00:01.150 [TLS] handshake started cipher TLS_AES_256_GCM_SHA384 curve X25519\n")
+	netLogs.WriteString("10:00:01.200 [TLS] handshake completed session_resumed=false\n")
+	netLogs.WriteString("10:00:01.300 [HTTP2] stream 1 opened headers :method=POST :path=/api/v1/memory/recall\n")
+	netLogs.WriteString("10:00:01.400 [ROUTER] route matched cluster_ingress rule priority=100\n")
+	netLogs.WriteString("10:00:01.500 [NET] packet drop detected queue_id=2 rx_dropped=3 buffer_overflow\n")
+	for netLogs.Len() < 1024 {
+		netLogs.WriteString("10:00:02.000 [NET] keepalive probe sent to peer router_bgp_neighbor=192.168.1.1\n")
+	}
+
+	req1KB := model.ConsolidateRequest{
+		TraceID:        "trace-net-1kb",
+		SessionID:      "sess-net-01",
+		TaskGoal:       "Analyze edge cluster networking logs and diagnose packet drops",
+		Outcome:        model.OutcomeSuccess,
+		ExecutionTrace: netLogs.String(),
+		Synchronous:    true,
+	}
+
+	body1, _ := json.Marshal(req1KB)
+	r1 := httptest.NewRequest(http.MethodPost, "/api/v1/memory/consolidate", bytes.NewReader(body1))
+	r1.Header.Set("Content-Type", "application/json")
+	w1 := httptest.NewRecorder()
+	server.ServeHTTP(w1, r1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("expected 200 for 1KB trace, got %d: %s", w1.Code, w1.Body.String())
+	}
+	var resp1 model.ConsolidateResponse
+	_ = json.Unmarshal(w1.Body.Bytes(), &resp1)
+
+	// 2. Parquet trace (~10 KB)
+	var parquetLogs strings.Builder
+	parquetLogs.WriteString("09:00:00 [PARQUET_WRITER] Initialising file schema version=2.6 num_columns=12\n")
+	for parquetLogs.Len() < 10*1024 {
+		idx := parquetLogs.Len() / 120
+		parquetLogs.WriteString(fmt.Sprintf("09:00:%02d [ROW_GROUP_%d] written 25000 records compressed_size=84200 snappy_ratio=0.51 crc32=98af12\n",
+			idx%60, idx))
+		parquetLogs.WriteString(fmt.Sprintf("09:00:%02d [DICTIONARY_%d] column='sensor_id' unique_entries=450 page_offset=%d\n",
+			idx%60, idx, idx*4096))
+	}
+
+	req10KB := model.ConsolidateRequest{
+		TraceID:        "trace-parquet-10kb",
+		SessionID:      "sess-parquet-01",
+		TaskGoal:       "Validate Parquet columnar serialization and Snappy dictionary compression",
+		Outcome:        model.OutcomeSuccess,
+		ExecutionTrace: parquetLogs.String(),
+		Synchronous:    true,
+	}
+
+	body2, _ := json.Marshal(req10KB)
+	r2 := httptest.NewRequest(http.MethodPost, "/api/v1/memory/consolidate", bytes.NewReader(body2))
+	r2.Header.Set("Content-Type", "application/json")
+	w2 := httptest.NewRecorder()
+	server.ServeHTTP(w2, r2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("expected 200 for 10KB trace, got %d: %s", w2.Code, w2.Body.String())
+	}
+	var resp2 model.ConsolidateResponse
+	_ = json.Unmarshal(w2.Body.Bytes(), &resp2)
+
+	// 3. Cooling trace (~90 KB)
+	var coolingLogs strings.Builder
+	coolingLogs.WriteString("12:00:00.000 [THERMAL_CONTROLLER] Initialised active PID cooling control loop\n")
+	for coolingLogs.Len() < 90*1024 {
+		sec := (coolingLogs.Len() / 200) % 3600
+		temp := 60.0 + float64(sec%25)
+		pwm := 2500 + (sec % 3500)
+		coolingLogs.WriteString(fmt.Sprintf("12:%02d:%02d [SAMPLE_%d] zone0_temp=%.2fC fan_pwm=%drpm pid_err=%.2f duty_cycle=0.%d throttling=nominal\n",
+			sec/60, sec%60, sec, temp, pwm, temp-65.0, (pwm*100)/6000))
+	}
+
+	req90KB := model.ConsolidateRequest{
+		TraceID:        "trace-cooling-90kb",
+		SessionID:      "sess-cooling-01",
+		TaskGoal:       "Monitor edge cluster cooling telemetry and adaptive PWM fan governor",
+		Outcome:        model.OutcomeSuccess,
+		ExecutionTrace: coolingLogs.String(),
+		Synchronous:    true,
+	}
+
+	body3, _ := json.Marshal(req90KB)
+	r3 := httptest.NewRequest(http.MethodPost, "/api/v1/memory/consolidate", bytes.NewReader(body3))
+	r3.Header.Set("Content-Type", "application/json")
+	w3 := httptest.NewRecorder()
+	server.ServeHTTP(w3, r3)
+	if w3.Code != http.StatusOK {
+		t.Fatalf("expected 200 for 90KB trace, got %d: %s", w3.Code, w3.Body.String())
+	}
+	var resp3 model.ConsolidateResponse
+	_ = json.Unmarshal(w3.Body.Bytes(), &resp3)
+
+	t.Logf("API Consolidation Results: 1KB=%d entities, 10KB=%d entities, 90KB=%d entities",
+		resp1.EntitiesExtracted, resp2.EntitiesExtracted, resp3.EntitiesExtracted)
+
+	// Verify counts vary with trace content and no fixed 11-entity count remains
+	if resp1.EntitiesExtracted == resp2.EntitiesExtracted || resp2.EntitiesExtracted == resp3.EntitiesExtracted ||
+		resp1.EntitiesExtracted == resp3.EntitiesExtracted {
+		t.Errorf("entity counts did not vary across traces: 1KB=%d, 10KB=%d, 90KB=%d",
+			resp1.EntitiesExtracted, resp2.EntitiesExtracted, resp3.EntitiesExtracted)
+	}
+	if resp1.EntitiesExtracted == 11 || resp2.EntitiesExtracted == 11 || resp3.EntitiesExtracted == 11 {
+		t.Errorf("fixed 11-entity count detected: 1KB=%d, 10KB=%d, 90KB=%d",
+			resp1.EntitiesExtracted, resp2.EntitiesExtracted, resp3.EntitiesExtracted)
+	}
+}
+
 
 

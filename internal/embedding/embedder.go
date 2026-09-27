@@ -30,7 +30,7 @@ type Config struct {
 	Enabled   bool          // SEKHA_EMBEDDING_ENABLED (default: false unless explicitly enabled)
 	URL       string        // SEKHA_EMBEDDING_URL
 	Dimension int           // SEKHA_EMBEDDING_DIM (default: 384)
-	Timeout   time.Duration // SEKHA_EMBEDDING_TIMEOUT_MS (default: 500ms)
+	Timeout   time.Duration // SEKHA_EMBEDDING_TIMEOUT_MS (default: 5000ms)
 	APIKey    string        // SEKHA_EMBEDDING_API_KEY (fallback to SEKHA_API_KEY)
 }
 
@@ -40,7 +40,7 @@ func DefaultConfig() Config {
 		Enabled:   false,
 		URL:       "",
 		Dimension: model.DefaultVectorDim, // 384
-		Timeout:   500 * time.Millisecond,
+		Timeout:   5000 * time.Millisecond,
 		APIKey:    "",
 	}
 }
@@ -178,7 +178,7 @@ func NewClient(cfg Config, fallback Embedder) *Client {
 		cfg.Dimension = model.DefaultVectorDim
 	}
 	if cfg.Timeout <= 0 {
-		cfg.Timeout = 500 * time.Millisecond
+		cfg.Timeout = 5000 * time.Millisecond
 	}
 	if fallback == nil {
 		fallback = NewMockEmbedder(cfg.Dimension)

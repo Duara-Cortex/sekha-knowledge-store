@@ -51,6 +51,11 @@ type EpisodicTrace struct {
 	SessionID        string            `json:"session_id"`
 	TaskGoal         string            `json:"task_goal"`
 	Outcome          string            `json:"outcome"`
+	ExecutionTrace   string            `json:"execution_trace,omitempty"`
+	Trace            string            `json:"trace,omitempty"`
+	RawTrace         string            `json:"raw_trace,omitempty"`
+	Logs             string            `json:"logs,omitempty"`
+	TracePayload     any               `json:"trace_payload,omitempty"`
 	SensoryContext   []SensoryItem     `json:"sensory_context,omitempty"`
 	Trajectory       []TrajectoryStep  `json:"trajectory,omitempty"`
 	CandidateActions []CandidateAction `json:"candidate_actions,omitempty"`
@@ -61,6 +66,26 @@ type EpisodicTrace struct {
 	IsSecret         bool              `json:"is_secret,omitempty"`
 }
 
+// GetExecutionTraceText returns any raw execution trace or log content present on the trace.
+func (t *EpisodicTrace) GetExecutionTraceText() string {
+	if s := strings.TrimSpace(t.ExecutionTrace); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(t.Trace); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(t.RawTrace); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(t.Logs); s != "" {
+		return s
+	}
+	if str, ok := t.TracePayload.(string); ok && strings.TrimSpace(str) != "" {
+		return str
+	}
+	return ""
+}
+
 // ConsolidateRequest defines the ingestion payload for POST /api/v1/memory/consolidate.
 type ConsolidateRequest struct {
 	TraceID          string            `json:"trace_id,omitempty"`
@@ -69,6 +94,11 @@ type ConsolidateRequest struct {
 	ActiveGoal       string            `json:"active_goal,omitempty"` // Fallback for Node 2 working memory state
 	Outcome          string            `json:"outcome,omitempty"`
 	Status           string            `json:"status,omitempty"` // Fallback for Node 2 status
+	ExecutionTrace   string            `json:"execution_trace,omitempty"`
+	Trace            string            `json:"trace,omitempty"`
+	RawTrace         string            `json:"raw_trace,omitempty"`
+	Logs             string            `json:"logs,omitempty"`
+	TracePayload     any               `json:"trace_payload,omitempty"`
 	SensoryContext   []SensoryItem     `json:"sensory_context,omitempty"`
 	Trajectory       []TrajectoryStep  `json:"trajectory,omitempty"`
 	CandidateActions []CandidateAction `json:"candidate_actions,omitempty"`

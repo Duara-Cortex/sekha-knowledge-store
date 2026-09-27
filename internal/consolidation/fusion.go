@@ -3,6 +3,7 @@ package consolidation
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Duara-Cortex/sekha-knowledge-store/internal/model"
@@ -45,9 +46,32 @@ func (f *FusionEngine) Fuse(ctx context.Context, extraction ExtractionResult, re
 	}
 
 	nodesToInsert := make([]model.Node, 0)
+	batchCreated := make(map[string]string) // dedupKey -> canonicalID
+	batchNodeIndex := make(map[string]int)  // canonicalID -> index in nodesToInsert
 
 	// 1. Reconcile entities against existing persistent nodes
 	for _, extracted := range extraction.Entities {
+		dedupKey := strings.ToLower(strings.TrimSpace(extracted.Label)) + "::" + strings.ToLower(strings.TrimSpace(extracted.EntityType))
+
+		// Check if already reconciled in this batch
+		if canonID, inBatch := batchCreated[dedupKey]; inBatch {
+			result.EntityIDMappings[extracted.ID] = canonID
+			if idx, ok := batchNodeIndex[canonID]; ok && idx < len(nodesToInsert) {
+				if extracted.ImportanceScore > nodesToInsert[idx].ImportanceScore {
+					nodesToInsert[idx].ImportanceScore = extracted.ImportanceScore
+				}
+				deltaStability := f.config.HebbianLearningRate * extracted.Salience
+				if nodesToInsert[idx].StabilityScore+deltaStability > 1.0 {
+					nodesToInsert[idx].StabilityScore = 1.0
+				} else {
+					nodesToInsert[idx].StabilityScore += deltaStability
+				}
+				nodesToInsert[idx].AccessCount++
+			}
+			result.EntitiesFused++
+			continue
+		}
+
 		existing, err := f.store.FindMatchingNode(ctx, extracted.Label, extracted.EntityType)
 		if err != nil {
 			return nil, fmt.Errorf("error checking existing node for %s: %w", extracted.Label, err)
@@ -56,6 +80,7 @@ func (f *FusionEngine) Fuse(ctx context.Context, extraction ExtractionResult, re
 		if existing != nil {
 			// Entity deduplication match: preserve existing persistent node ID
 			result.EntityIDMappings[extracted.ID] = existing.ID
+			batchCreated[dedupKey] = existing.ID
 
 			if extracted.ImportanceScore > existing.ImportanceScore {
 				existing.ImportanceScore = extracted.ImportanceScore
@@ -78,6 +103,8 @@ func (f *FusionEngine) Fuse(ctx context.Context, extraction ExtractionResult, re
 			// Novel entity: allocate persistent knowledge vertex
 			canonicalID := extracted.ID
 			result.EntityIDMappings[extracted.ID] = canonicalID
+			batchCreated[dedupKey] = canonicalID
+			batchNodeIndex[canonicalID] = len(nodesToInsert)
 
 			initialStability := extracted.ImportanceScore
 			if initialStability <= 0 {

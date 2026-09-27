@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -36,6 +37,8 @@ func main() {
 	tlsKey := flag.String("tls-key", "", "Path to TLS private key file (or SEKHA_TLS_KEY env)")
 	apiKeyFlag := flag.String("api-key", "", "API key for authentication (or SEKHA_API_KEY env)")
 	masterKeyFlag := flag.String("master-key", "", "Master key for encryption-at-rest (or SEKHA_MASTER_KEY env)")
+	readTimeout := flag.Duration("read-timeout", 120*time.Second, "HTTP server read timeout (adequate for large trace ingestion)")
+	writeTimeout := flag.Duration("write-timeout", 120*time.Second, "HTTP server write timeout (adequate for large trace consolidation)")
 	flag.Parse()
 
 	certFile := strings.TrimSpace(*tlsCert)
@@ -141,8 +144,19 @@ func main() {
 
 	mux.HandleFunc("POST /api/v1/memory/consolidate", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		limit := api.MaxPayloadBytes()
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
 		var req model.ConsolidateRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				w.WriteHeader(http.StatusRequestEntityTooLarge)
+				_ = json.NewEncoder(w).Encode(model.ConsolidateResponse{
+					Status:  "error",
+					Message: fmt.Sprintf("payload exceeds maximum allowed body size of %d bytes: %v", limit, err),
+				})
+				return
+			}
 			w.WriteHeader(http.StatusBadRequest)
 			_ = json.NewEncoder(w).Encode(model.ConsolidateResponse{
 				Status:  "error",
@@ -209,9 +223,9 @@ func main() {
 	httpServer := &http.Server{
 		Addr:         fmt.Sprintf(":%d", *port),
 		Handler:      handler,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 60 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		ReadTimeout:  *readTimeout,
+		WriteTimeout: *writeTimeout,
+		IdleTimeout:  120 * time.Second,
 	}
 
 	stop := make(chan os.Signal, 1)
