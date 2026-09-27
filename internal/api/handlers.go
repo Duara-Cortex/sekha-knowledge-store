@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -219,10 +221,34 @@ func (s *Server) handleRecall(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+// MaxPayloadBytes returns the maximum request body size allowed for ingestion endpoints.
+// Defaults to 10 MB (10485760 bytes), but can be configured via SEKHA_MAX_BODY_BYTES (minimum 1 MB).
+func MaxPayloadBytes() int64 {
+	const defaultLimit = 10 * 1024 * 1024 // 10 MB
+	if val := os.Getenv("SEKHA_MAX_BODY_BYTES"); val != "" {
+		if parsed, err := strconv.ParseInt(strings.TrimSpace(val), 10, 64); err == nil && parsed >= 1024*1024 {
+			return parsed
+		}
+	}
+	return defaultLimit
+}
+
 // handleInsert processes POST /api/v1/memory/insert.
 func (s *Server) handleInsert(w http.ResponseWriter, r *http.Request) {
+	limit := MaxPayloadBytes()
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+
 	var req model.InsertRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_ = json.NewEncoder(w).Encode(model.InsertResponse{
+				Status: "error",
+				Error:  fmt.Sprintf("request payload exceeds maximum allowed size of %d bytes", limit),
+			})
+			return
+		}
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(model.InsertResponse{
 			Status: "error",
@@ -354,8 +380,20 @@ func (s *Server) getEmbeddingHealth(ctx context.Context) model.EmbeddingEngineHe
 
 // handleConsolidate processes POST /api/v1/memory/consolidate dispatched from Node 2.
 func (s *Server) handleConsolidate(w http.ResponseWriter, r *http.Request) {
+	limit := MaxPayloadBytes()
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+
 	var req model.ConsolidateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_ = json.NewEncoder(w).Encode(model.ConsolidateResponse{
+				Status:  "error",
+				Message: fmt.Sprintf("payload exceeds maximum allowed body size of %d bytes: %v", limit, err),
+			})
+			return
+		}
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(model.ConsolidateResponse{
 			Status:  "error",
@@ -376,6 +414,8 @@ func (s *Server) handleConsolidate(w http.ResponseWriter, r *http.Request) {
 
 	// Compute dense embeddings on-the-fly for any created nodes missing vectors
 	if len(resp.CreatedNodes) > 0 {
+		var missingIndices []int
+		var textsToEmbed []string
 		for i := range resp.CreatedNodes {
 			if req.IsSecret && !resp.CreatedNodes[i].IsSecret {
 				resp.CreatedNodes[i].IsSecret = true
@@ -383,17 +423,28 @@ func (s *Server) handleConsolidate(w http.ResponseWriter, r *http.Request) {
 			if len(resp.CreatedNodes[i].Embedding) == 0 {
 				text := strings.TrimSpace(resp.CreatedNodes[i].Label + " " + resp.CreatedNodes[i].Summary)
 				if text != "" {
-					if s.embedder != nil {
-						if emb, err := s.embedder.EmbedText(r.Context(), text); err == nil && len(emb) > 0 {
-							resp.CreatedNodes[i].Embedding = emb
-						}
-					}
-					if len(resp.CreatedNodes[i].Embedding) == 0 {
-						resp.CreatedNodes[i].Embedding = embedding.Generate(text, model.DefaultVectorDim)
-					}
+					missingIndices = append(missingIndices, i)
+					textsToEmbed = append(textsToEmbed, text)
 				}
 			}
 		}
+
+		if len(textsToEmbed) > 0 {
+			var embeddedVectors [][]float32
+			if s.embedder != nil {
+				if batchVecs, err := s.embedder.EmbedBatch(r.Context(), textsToEmbed); err == nil && len(batchVecs) == len(textsToEmbed) {
+					embeddedVectors = batchVecs
+				}
+			}
+			for idx, origIdx := range missingIndices {
+				if idx < len(embeddedVectors) && len(embeddedVectors[idx]) > 0 {
+					resp.CreatedNodes[origIdx].Embedding = embeddedVectors[idx]
+				} else {
+					resp.CreatedNodes[origIdx].Embedding = embedding.Generate(textsToEmbed[idx], model.DefaultVectorDim)
+				}
+			}
+		}
+
 		// Register novel consolidated nodes directly with in-memory recall index
 		if s.engine != nil {
 			s.engine.RegisterNodes(resp.CreatedNodes)

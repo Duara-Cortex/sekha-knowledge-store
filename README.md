@@ -108,6 +108,12 @@ CREATE TABLE IF NOT EXISTS episodic_traces (
 | `GET` | `/api/v1/consolidation/stats` | Telemetry on active vs archived nodes, reinforced edges, and mean stability |
 | `GET` | `/api/v1/consolidation/health` | Subsystem health telemetry (public unauthenticated) |
 
+### Large Trace Ingestion
+
+- `POST /api/v1/memory/consolidate` and `POST /api/v1/memory/insert` accept request bodies up to 10 MB by default. Set `SEKHA_MAX_BODY_BYTES` to change the limit (values below 1 MB are ignored). Oversized requests receive `413 Request Entity Too Large`.
+- Both daemons accept `-read-timeout` and `-write-timeout` flags (default `120s`) so synchronous consolidation of large traces completes within one request.
+- Raw execution traces and logs can be sent inline as a string in `execution_trace` (aliases: `trace`, `raw_trace`, `logs`, or a string `trace_payload`). Incident lines, sampled log events, and frequency-ranked domain concepts are extracted in proportion to trace size.
+
 ---
 
 ## Security & Endpoint Hardening

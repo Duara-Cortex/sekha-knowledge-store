@@ -858,3 +858,409 @@ func TestConsolidationSecretBackgroundCycle(t *testing.T) {
 		t.Errorf("expected to find plaintext %q in unmasked recall results", secretData)
 	}
 }
+
+func TestDynamicEntityScaling_TraceLengthsAndTopics(t *testing.T) {
+	s := createTestStore(t, "test_scaling.db")
+	cfg := model.DefaultDecayConfig()
+	engine := consolidation.NewEngine(s, cfg)
+	ctx := context.Background()
+
+	// 1. Networking Logs (~1 KB trace)
+	var netLogs strings.Builder
+	netLogs.WriteString("10:00:01.000 [NET] interface eth0 link up 1000Mbps full duplex\n")
+	netLogs.WriteString("10:00:01.100 [TCP] inbound connection from 192.168.1.150:54321 to 192.168.1.10:8084\n")
+	netLogs.WriteString("10:00:01.150 [TLS] handshake started cipher TLS_AES_256_GCM_SHA384 curve X25519\n")
+	netLogs.WriteString("10:00:01.200 [TLS] handshake completed session_resumed=false\n")
+	netLogs.WriteString("10:00:01.300 [HTTP2] stream 1 opened headers :method=POST :path=/api/v1/memory/recall\n")
+	netLogs.WriteString("10:00:01.400 [ROUTER] route matched cluster_ingress rule priority=100\n")
+	netLogs.WriteString("10:00:01.500 [NET] packet drop detected queue_id=2 rx_dropped=3 buffer_overflow\n")
+	netLogs.WriteString("10:00:01.600 [TCP] connection closed fin_wait_2 duration=500ms bytes_sent=1284\n")
+	for netLogs.Len() < 1024 {
+		netLogs.WriteString("10:00:02.000 [NET] keepalive probe sent to peer router_bgp_neighbor=192.168.1.1\n")
+	}
+
+	trace1KB := model.ConsolidateRequest{
+		TraceID:        "trace-net-1kb",
+		SessionID:      "sess-net-01",
+		TaskGoal:       "Analyze edge cluster networking logs and diagnose packet drops",
+		Outcome:        model.OutcomeSuccess,
+		ExecutionTrace: netLogs.String(),
+		Synchronous:    true,
+	}
+
+	resp1KB, err := engine.IngestTrace(ctx, trace1KB)
+	if err != nil {
+		t.Fatalf("failed ingesting 1 KB trace: %v", err)
+	}
+
+	t.Logf("1 KB Networking trace: %d entities extracted, %d nodes fused",
+		resp1KB.EntitiesExtracted, resp1KB.NodesFused)
+
+	// 2. Parquet Serialization (~10 KB trace)
+	var parquetLogs strings.Builder
+	parquetLogs.WriteString("09:00:00 [PARQUET_WRITER] Initialising file schema version=2.6 num_columns=12\n")
+	parquetLogs.WriteString("09:00:00 [SCHEMA] column 0: timestamp type=INT64 logical_type=TIMESTAMP_MILLIS\n")
+	parquetLogs.WriteString("09:00:00 [SCHEMA] column 1: sensor_id type=BYTE_ARRAY logical_type=UTF8 dictionary=true\n")
+	parquetLogs.WriteString("09:00:00 [SCHEMA] column 2: cpu_temp type=FLOAT encoding=PLAIN compression=SNAPPY\n")
+	parquetLogs.WriteString("09:00:00 [SCHEMA] column 3: memory_used type=INT64 encoding=RLE_DICTIONARY\n")
+	for parquetLogs.Len() < 10*1024 {
+		idx := parquetLogs.Len() / 120
+		parquetLogs.WriteString(fmt.Sprintf("09:00:%02d [ROW_GROUP_%d] written 25000 records compressed_size=84200 uncompressed_size=164000 snappy_ratio=0.51 crc32=98af12\n",
+			idx%60, idx))
+		parquetLogs.WriteString(fmt.Sprintf("09:00:%02d [DICTIONARY_%d] column='sensor_id' unique_entries=450 page_offset=%d\n",
+			idx%60, idx, idx*4096))
+	}
+
+	trace10KB := model.ConsolidateRequest{
+		TraceID:        "trace-parquet-10kb",
+		SessionID:      "sess-parquet-01",
+		TaskGoal:       "Validate Parquet columnar serialization and Snappy dictionary compression",
+		Outcome:        model.OutcomeSuccess,
+		ExecutionTrace: parquetLogs.String(),
+		Synchronous:    true,
+	}
+
+	resp10KB, err := engine.IngestTrace(ctx, trace10KB)
+	if err != nil {
+		t.Fatalf("failed ingesting 10 KB trace: %v", err)
+	}
+
+	t.Logf("10 KB Parquet trace: %d entities extracted, %d nodes fused",
+		resp10KB.EntitiesExtracted, resp10KB.NodesFused)
+
+	// 3. Cooling Telemetry (~90 KB trace)
+	var coolingLogs strings.Builder
+	coolingLogs.WriteString("12:00:00.000 [THERMAL_CONTROLLER] Initialised active PID cooling control loop\n")
+	coolingLogs.WriteString("12:00:00.010 [CONFIG] target_temperature=65.0C max_safe_temp=85.0C min_pwm=2000rpm\n")
+	coolingLogs.WriteString("12:00:00.050 [SENSOR_CALIBRATION] zone0=cpu_core zone1=gpu_embedded zone2=ambient_exhaust\n")
+	for coolingLogs.Len() < 90*1024 {
+		sec := (coolingLogs.Len() / 200) % 3600
+		temp := 60.0 + float64(sec%25)
+		pwm := 2500 + (sec % 3500)
+		coolingLogs.WriteString(fmt.Sprintf("12:%02d:%02d [SAMPLE_%d] zone0_temp=%.2fC zone1_temp=%.2fC fan_pwm=%drpm pid_err=%.2f duty_cycle=0.%d throttling=nominal\n",
+			sec/60, sec%60, sec, temp, temp-5.0, pwm, temp-65.0, (pwm*100)/6000))
+		coolingLogs.WriteString(fmt.Sprintf("12:%02d:%02d [ALERT_POLICY] check_sensor_deviation delta=%.2fC hysteresis=0.5C cooling_channel=%d\n",
+			sec/60, sec%60, temp-55.0, sec%4))
+	}
+	coolingLogs.WriteString("12:59:59.900 [FAN_GOVERNOR] ERROR fan1 tachometer failed, forcing max duty on cooling_channel=1\n")
+
+	trace90KB := model.ConsolidateRequest{
+		TraceID:        "trace-cooling-90kb",
+		SessionID:      "sess-cooling-01",
+		TaskGoal:       "Monitor edge cluster cooling telemetry and adaptive PWM fan governor",
+		Outcome:        model.OutcomeSuccess,
+		ExecutionTrace: coolingLogs.String(),
+		Synchronous:    true,
+	}
+
+	resp90KB, err := engine.IngestTrace(ctx, trace90KB)
+	if err != nil {
+		t.Fatalf("failed ingesting 90 KB trace: %v", err)
+	}
+
+	t.Logf("90 KB Cooling trace: %d entities extracted, %d nodes fused",
+		resp90KB.EntitiesExtracted, resp90KB.NodesFused)
+
+	// Confirm entity counts vary with trace content. Counts are not required to be monotonic
+	// across topics: a long but repetitive trace can legitimately yield fewer concepts.
+	counts := map[int]bool{resp1KB.EntitiesExtracted: true, resp10KB.EntitiesExtracted: true, resp90KB.EntitiesExtracted: true}
+	if len(counts) != 3 {
+		t.Errorf("entity counts did not vary across traces: 1KB=%d, 10KB=%d, 90KB=%d",
+			resp1KB.EntitiesExtracted, resp10KB.EntitiesExtracted, resp90KB.EntitiesExtracted)
+	}
+	for name, n := range map[string]int{"1KB": resp1KB.EntitiesExtracted, "10KB": resp10KB.EntitiesExtracted, "90KB": resp90KB.EntitiesExtracted} {
+		if n == 11 {
+			t.Errorf("fixed 11-entity count detected for %s trace", name)
+		}
+	}
+
+	// Confirm extracted concepts reflect each trace's subject matter.
+	assertConcepts(t, "networking", resp1KB.CreatedNodes, "tls", "packet", "handshake")
+	assertConcepts(t, "parquet", resp10KB.CreatedNodes, "parquet_writer", "snappy", "dictionary")
+	assertConcepts(t, "cooling", resp90KB.CreatedNodes, "fan_pwm", "pid_err", "thermal_controller")
+
+	// Confirm the single injected failure line is captured as an incident despite sampling.
+	foundIncident := false
+	for _, n := range resp90KB.CreatedNodes {
+		if n.EntityType == "incident" && strings.Contains(n.Label, "tachometer failed") {
+			foundIncident = true
+		}
+	}
+	if !foundIncident {
+		t.Errorf("expected ERROR line in 90 KB cooling trace to be extracted as an incident")
+	}
+}
+
+// assertConcepts checks that the wanted concepts were extracted and that no concept is a
+// value-like token (timestamps, readings, digests) rather than a domain term.
+func assertConcepts(t *testing.T, topic string, nodes []model.Node, want ...string) {
+	t.Helper()
+	concepts := make(map[string]bool)
+	for _, n := range nodes {
+		if n.EntityType != "concept" {
+			continue
+		}
+		concepts[n.Label] = true
+		letters := 0
+		for _, c := range n.Label {
+			if c >= 'a' && c <= 'z' {
+				letters++
+			}
+		}
+		if letters < 3 || strings.HasSuffix(n.Label, "rpm") || strings.Contains(n.Label, ":") {
+			t.Errorf("%s trace: value-like token extracted as concept: %q", topic, n.Label)
+		}
+	}
+	for _, w := range want {
+		if !concepts[w] {
+			t.Errorf("%s trace: expected concept %q to be extracted", topic, w)
+		}
+	}
+}
+
+func TestGraphFusion_OverlappingEntitiesDuplicatePrevention(t *testing.T) {
+	s := createTestStore(t, "test_dedup_overlap.db")
+	cfg := model.DefaultDecayConfig()
+	engine := consolidation.NewEngine(s, cfg)
+	ctx := context.Background()
+
+	// Ingest trace with repeatedly referenced concept "snappy_compression"
+	trace := model.ConsolidateRequest{
+		TraceID:     "trace-dedup-01",
+		SessionID:   "sess-dedup",
+		TaskGoal:    "Verify Snappy compression in storage engine",
+		Outcome:     model.OutcomeSuccess,
+		Synchronous: true,
+		Trajectory: []model.TrajectoryStep{
+			{
+				StepIndex:   1,
+				Thought:     "Testing snappy_compression performance",
+				Action:      "apply_snappy_compression",
+				Observation: "snappy_compression succeeded",
+				Status:      "success",
+			},
+			{
+				StepIndex:   2,
+				Thought:     "Benchmarking snappy_compression throughput",
+				Action:      "verify_snappy_compression",
+				Observation: "snappy_compression ratio verified",
+				Status:      "success",
+			},
+		},
+		SensoryContext: []model.SensoryItem{
+			{
+				Text:     "Active telemetry verifies snappy_compression is operational",
+				Salience: 0.9,
+			},
+		},
+	}
+
+	resp, err := engine.IngestTrace(ctx, trace)
+	if err != nil {
+		t.Fatalf("failed ingesting trace: %v", err)
+	}
+
+	t.Logf("Deduplication test: %d entities extracted, %d nodes fused",
+		resp.EntitiesExtracted, resp.NodesFused)
+
+	// Verify only ONE node with label "snappy_compression" exists in SQLite
+	nodes, err := s.GetAllActiveNodes(ctx)
+	if err != nil {
+		t.Fatalf("failed querying active nodes: %v", err)
+	}
+	snappyCount := 0
+	for _, n := range nodes {
+		if strings.ToLower(n.Label) == "snappy_compression" {
+			snappyCount++
+		}
+	}
+
+	if snappyCount != 1 {
+		t.Errorf("expected exactly 1 canonical node for 'snappy_compression', got %d", snappyCount)
+	}
+}
+
+
+func TestGraphFusion_CrossTraceDuplicatePrevention(t *testing.T) {
+	s := createTestStore(t, "test_dedup_cross_trace.db")
+	engine := consolidation.NewEngine(s, model.DefaultDecayConfig())
+	ctx := context.Background()
+
+	logs := "10:00:01 [PARQUET_WRITER] snappy compression enabled for dictionary pages\n" +
+		"10:00:02 [PARQUET_WRITER] row group flushed with snappy dictionary encoding\n"
+	first := model.ConsolidateRequest{
+		TraceID: "trace-cross-01", SessionID: "sess-cross-01",
+		TaskGoal: "Validate Parquet snappy compression", Outcome: model.OutcomeSuccess,
+		ExecutionTrace: logs, Synchronous: true,
+	}
+	second := first
+	second.TraceID, second.SessionID = "trace-cross-02", "sess-cross-02"
+
+	if _, err := engine.IngestTrace(ctx, first); err != nil {
+		t.Fatalf("failed ingesting first trace: %v", err)
+	}
+	before, err := s.GetAllActiveNodes(ctx)
+	if err != nil {
+		t.Fatalf("failed querying nodes: %v", err)
+	}
+	resp, err := engine.IngestTrace(ctx, second)
+	if err != nil {
+		t.Fatalf("failed ingesting second trace: %v", err)
+	}
+	after, err := s.GetAllActiveNodes(ctx)
+	if err != nil {
+		t.Fatalf("failed querying nodes: %v", err)
+	}
+
+	if len(after) != len(before) {
+		t.Errorf("expected overlapping trace to fuse into existing nodes: %d nodes before, %d after", len(before), len(after))
+	}
+	if len(resp.CreatedNodes) != 0 || resp.NodesFused != resp.EntitiesExtracted {
+		t.Errorf("expected all %d entities to fuse into existing nodes, got %d created, %d fused",
+			resp.EntitiesExtracted, len(resp.CreatedNodes), resp.NodesFused)
+	}
+
+	labels := make(map[string]int)
+	for _, n := range after {
+		labels[n.EntityType+"::"+strings.ToLower(n.Label)]++
+	}
+	for key, n := range labels {
+		if n > 1 {
+			t.Errorf("duplicate node %q stored %d times", key, n)
+		}
+	}
+}
+
+func TestFusion_InBatchDuplicateEntitiesShareCanonicalNode(t *testing.T) {
+	s := createTestStore(t, "test_dedup_in_batch.db")
+	fusion := consolidation.NewFusionEngine(s, model.DefaultDecayConfig())
+	ctx := context.Background()
+
+	extraction := consolidation.ExtractionResult{
+		Salience: 0.8,
+		Entities: []model.ExtractedEntity{
+			{ID: "goal-a", EntityType: "task_goal", Label: "Tune cooling loop", Salience: 0.8, ImportanceScore: 0.85},
+			{ID: "evt-a", EntityType: "incident", Label: "[FAN] tachometer failed", Salience: 0.6, ImportanceScore: 0.7},
+			{ID: "evt-b", EntityType: "incident", Label: "[fan] Tachometer failed ", Salience: 0.6, ImportanceScore: 0.8},
+		},
+		Edges: []model.ExtractedRelation{
+			{SourceID: "evt-a", TargetID: "goal-a", RelationType: "context_for", Weight: 0.7},
+			{SourceID: "evt-b", TargetID: "goal-a", RelationType: "context_for", Weight: 0.7},
+		},
+	}
+
+	res, err := fusion.Fuse(ctx, extraction, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("fusion failed: %v", err)
+	}
+	if res.EntitiesCreated != 2 || res.EntitiesFused != 1 {
+		t.Errorf("expected 2 created and 1 fused, got %d created and %d fused", res.EntitiesCreated, res.EntitiesFused)
+	}
+	if res.EntityIDMappings["evt-b"] != "evt-a" {
+		t.Errorf("expected evt-b to map to canonical evt-a, got %q", res.EntityIDMappings["evt-b"])
+	}
+
+	nodes, err := s.GetAllActiveNodes(ctx)
+	if err != nil {
+		t.Fatalf("failed querying nodes: %v", err)
+	}
+	if len(nodes) != 2 {
+		t.Fatalf("expected 2 stored nodes, got %d", len(nodes))
+	}
+	for _, n := range nodes {
+		if n.ID == "evt-a" && n.ImportanceScore != 0.8 {
+			t.Errorf("expected canonical node to take the higher importance 0.8, got %v", n.ImportanceScore)
+		}
+	}
+}
+
+func TestExecutionTrace_RepeatedIncidentsDoNotExhaustEventBudget(t *testing.T) {
+	s := createTestStore(t, "test_retry_incidents.db")
+	engine := consolidation.NewEngine(s, model.DefaultDecayConfig())
+	ctx := context.Background()
+
+	var logs strings.Builder
+	for i := 0; i < 100; i++ {
+		logs.WriteString(fmt.Sprintf("10:00:%02d.%03d [UPLINK] ERROR connection refused by 10.0.0.7:9000, retrying\n", i%60, i))
+		logs.WriteString(fmt.Sprintf("10:00:%02d.%03d [QUEUE_%d] backlog depth=%d consumer_lag=%dms\n", i%60, i, i, 100+i, 20*i))
+	}
+
+	resp, err := engine.IngestTrace(ctx, model.ConsolidateRequest{
+		TraceID: "trace-retry-loop", SessionID: "sess-retry",
+		TaskGoal: "Diagnose uplink retry storm", Outcome: model.OutcomeFailure,
+		ExecutionTrace: logs.String(), Synchronous: true,
+	})
+	if err != nil {
+		t.Fatalf("failed ingesting trace: %v", err)
+	}
+
+	incidents, events := 0, 0
+	for _, n := range resp.CreatedNodes {
+		switch n.EntityType {
+		case "incident":
+			incidents++
+		case "telemetry", "procedure", "episodic_event":
+			events++
+		}
+	}
+	if incidents != 1 {
+		t.Errorf("expected repeated ERROR lines to collapse into 1 incident, got %d", incidents)
+	}
+	if events == 0 {
+		t.Errorf("expected non-incident lines to be sampled alongside the repeated incident")
+	}
+}
+
+// TestNode2ShapedPayload_EntityCountsVary covers the trajectory + sensory payload shape sent by
+// Node 2 (no execution_trace), which is the shape that previously always produced 11 entities.
+func TestNode2ShapedPayload_EntityCountsVary(t *testing.T) {
+	s := createTestStore(t, "test_node2_shape.db")
+	engine := consolidation.NewEngine(s, model.DefaultDecayConfig())
+	ctx := context.Background()
+
+	longObservation := strings.Repeat("Parquet writer flushed row group with snappy dictionary pages; column statistics min max null_count recorded; footer checksum verified. ", 20)
+	longSensory := strings.Repeat("Edge cooling telemetry: fan governor raised pwm duty as cpu die temperature crossed hysteresis band while ambient intake remained stable. ", 20)
+
+	cases := []struct {
+		name        string
+		goal        string
+		thought     string
+		observation string
+		sensory     string
+	}{
+		{"networking", "Diagnose packet loss on edge uplink", "Inspect interface counters for rx drops",
+			"rx_dropped counter rising on eth0 queue 2 due to ring buffer overflow under burst traffic from ingress router", "BGP neighbor session flapped twice in the last hour"},
+		{"parquet-long-observation", "Validate Parquet serialisation", "Check writer output", longObservation, "Writer completed"},
+		{"cooling-long-sensory", "Tune cooling governor", "Review thermal telemetry", "Governor adjusted duty cycle", longSensory},
+	}
+
+	counts := make(map[string]int)
+	for i, c := range cases {
+		resp, err := engine.IngestTrace(ctx, model.ConsolidateRequest{
+			TraceID: fmt.Sprintf("trace-node2-%d", i), SessionID: fmt.Sprintf("sess-node2-%d", i),
+			TaskGoal: c.goal, Outcome: model.OutcomeSuccess, Synchronous: true,
+			Trajectory: []model.TrajectoryStep{{
+				StepIndex: 1, Thought: c.thought, Action: "analyse", Observation: c.observation, Status: "success",
+			}},
+			SensoryContext: []model.SensoryItem{{Text: c.sensory, Salience: 0.8}},
+		})
+		if err != nil {
+			t.Fatalf("%s: failed ingesting trace: %v", c.name, err)
+		}
+		t.Logf("%s: %d entities extracted", c.name, resp.EntitiesExtracted)
+		counts[c.name] = resp.EntitiesExtracted
+	}
+
+	distinct := make(map[int]bool)
+	for _, n := range counts {
+		distinct[n] = true
+	}
+	if len(distinct) != len(cases) {
+		t.Errorf("expected entity counts to vary across Node 2 payloads, got %v", counts)
+	}
+	for _, name := range []string{"parquet-long-observation", "cooling-long-sensory"} {
+		if counts[name] <= 11 {
+			t.Errorf("%s: expected long payload to exceed the old 11-entity count, got %d", name, counts[name])
+		}
+	}
+}

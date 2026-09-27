@@ -31,6 +31,8 @@ func main() {
 	tlsKey := flag.String("tls-key", "", "Path to TLS private key file (or SEKHA_TLS_KEY env)")
 	apiKeyFlag := flag.String("api-key", "", "API key for authentication (or SEKHA_API_KEY env)")
 	masterKeyFlag := flag.String("master-key", "", "Master key for encryption-at-rest (or SEKHA_MASTER_KEY env)")
+	readTimeout := flag.Duration("read-timeout", 120*time.Second, "HTTP server read timeout (adequate for large trace ingestion)")
+	writeTimeout := flag.Duration("write-timeout", 120*time.Second, "HTTP server write timeout (adequate for large trace consolidation)")
 	flag.Parse()
 
 	certFile := strings.TrimSpace(*tlsCert)
@@ -125,9 +127,9 @@ func main() {
 	httpServer := &http.Server{
 		Addr:         fmt.Sprintf(":%d", *port),
 		Handler:      handler,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		ReadTimeout:  *readTimeout,
+		WriteTimeout: *writeTimeout,
+		IdleTimeout:  120 * time.Second,
 	}
 
 	// Graceful shutdown handling
